@@ -1,0 +1,41 @@
+diff --git a/include/hw/arm/ipod_touch_8900_engine.h b/include/hw/arm/ipod_touch_8900_engine.h
+index a43089f..c60487a 100644
+--- a/include/hw/arm/ipod_touch_8900_engine.h
++++ b/include/hw/arm/ipod_touch_8900_engine.h
+@@ -60,17 +60,31 @@ static void s5l8900_8900_engine_write(void *opaque, hwaddr offset, uint64_t valu
+     header8900 *header = malloc(sizeof(header8900));
+     address_space_rw(nsas, value, MEMTXATTRS_UNSPECIFIED, (uint8_t *)header, sizeof(header8900), 0);
+ 
+-	if( (header->magic[0] != 0x38) && // 8
+-	    (header->magic[1] != 0x39) && // 9
+-	    (header->magic[2] != 0x30) && // 0
++	if( (header->magic[0] != 0x38) || // 8
++	    (header->magic[1] != 0x39) || // 9
++	    (header->magic[2] != 0x30) || // 0
+ 	    (header->magic[3] != 0x30))  // 0
+ 	{
+ 		printf("Bad 8900 magic\n");
++		free(header);
+ 		return;
+ 	}
+ 
+-	if(header->encrypted == 0x03) { encrypted = 1; }
+-	else if( header->encrypted = 0x04 ) { encrypted = 0; }
++	/* The original 1A543a system kernel is a plaintext 8900 container.
++	 * Decrypting it corrupts the complzss stream. Flag 4 must be a no-op.
++	 */
++	if(header->encrypted == 0x04) {
++		printf("8900 plaintext image at 0x%08x; preserving payload\n", (unsigned)value);
++		free(header);
++		return;
++	}
++	if(header->encrypted != 0x03 || !header->sizeOfData ||
++	   header->sizeOfData > 32 * 1024 * 1024 ||
++	   header->sizeOfData % AES_BLOCK_SIZE) {
++		printf("Unsupported or invalid encrypted 8900 image\n");
++		free(header);
++		return;
++	}
+ 
+ 	data_begin = sizeof(header8900);
+ 	data_len = header->sizeOfData;

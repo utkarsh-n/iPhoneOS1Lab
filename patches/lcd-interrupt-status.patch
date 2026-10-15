@@ -1,0 +1,51 @@
+diff --git a/hw/arm/ipod_touch_lcd.c b/hw/arm/ipod_touch_lcd.c
+index f6a3bc6..dfd356b 100644
+--- a/hw/arm/ipod_touch_lcd.c
++++ b/hw/arm/ipod_touch_lcd.c
+@@ -3,6 +3,14 @@
+ #include "ui/console.h"
+ #include "hw/display/framebuffer.h"
+ 
++#define LCD_INT_FRAME_DONE 1u
++
++static void s5l8900_lcd_update_irq(IPodTouchLCDState *s)
++{
++    /* 0x14 enables interrupt sources; 0x18 contains pending sources. */
++    qemu_set_irq(s->irq, (s->unknown1 & s->unknown2) != 0);
++}
++
+ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     // fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
+@@ -80,10 +88,12 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned
+ 
+         case 0x14:
+             s->unknown1 = val;
++            s5l8900_lcd_update_irq(s);
+             break;
+         case 0x18:
+-            s->unknown2 = val;
+-            qemu_irq_lower(s->irq);
++            /* The CLCD driver acknowledges pending sources by writing ones. */
++            s->unknown2 &= ~val;
++            s5l8900_lcd_update_irq(s);
+             break;
+ 
+         case 0x20:
+@@ -248,7 +258,8 @@ static void refresh_timer_tick(void *opaque)
+ {
+     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
+ 
+-    qemu_irq_raise(s->irq);
++    s->unknown2 |= LCD_INT_FRAME_DONE;
++    s5l8900_lcd_update_irq(s);
+ 
+     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / LCD_REFRESH_RATE_FREQUENCY);
+ }
+@@ -298,4 +309,4 @@ static void ipod_touch_machine_types(void)
+     type_register_static(&ipod_touch_lcd_info);
+ }
+ 
+-type_init(ipod_touch_machine_types)
+\ No newline at end of file
++type_init(ipod_touch_machine_types)

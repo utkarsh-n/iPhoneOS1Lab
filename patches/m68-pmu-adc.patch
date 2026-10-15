@@ -1,0 +1,40 @@
+diff --git a/hw/arm/ipod_touch_pcf50633_pmu.c b/hw/arm/ipod_touch_pcf50633_pmu.c
+index cd7701a..19ff3e3 100644
+--- a/hw/arm/ipod_touch_pcf50633_pmu.c
++++ b/hw/arm/ipod_touch_pcf50633_pmu.c
+@@ -30,7 +30,13 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
+             res = 0; // battery power source
+             break;
+         case PMU_ADCC1:
+-            res = 0; // battery charge voltage
++            /* M68 iBoot expects completed ADC conversion, then the high
++             * result byte at 0x55. Model 682/1023 * 6000 = 4000 mV.
++             */
++            res = s->battery_adc_ready ? 0x82 : 0;
++            break;
++        case 0x55:
++            res = s->battery_adc_ready ? 0xaa : 0;
+             break;
+         case PMU_RTCSC:  // seconds
+             res = int_to_bcd(tm.tm_sec);
+@@ -101,4 +107,4 @@ static void pcf50633_register_types(void)
+     type_register_static(&pcf50633_info);
+ }
+ 
+-type_init(pcf50633_register_types)
+\ No newline at end of file
++type_init(pcf50633_register_types)
+diff --git a/include/hw/arm/ipod_touch_pcf50633_pmu.h b/include/hw/arm/ipod_touch_pcf50633_pmu.h
+index af090c5..15c6ef6 100644
+--- a/include/hw/arm/ipod_touch_pcf50633_pmu.h
++++ b/include/hw/arm/ipod_touch_pcf50633_pmu.h
+@@ -27,6 +27,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
+ typedef struct Pcf50633State {
+ 	I2CSlave i2c;
+ 	uint32_t cmd;
++    bool battery_adc_ready;
+ } Pcf50633State;
+ 
+-#endif
+\ No newline at end of file
++#endif

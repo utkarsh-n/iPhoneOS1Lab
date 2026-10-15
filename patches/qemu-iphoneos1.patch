@@ -1,0 +1,2792 @@
+diff --git a/hw/arm/ipod_touch.c b/hw/arm/ipod_touch.c
+index cbfe127c0b831051a8bc14abb75a7928dc3e9018..59328b1fcbe801384c884149cf8f215bffd86d7f 100644
+--- a/hw/arm/ipod_touch.c
++++ b/hw/arm/ipod_touch.c
+@@ -10,6 +10,8 @@
+ #include "hw/platform-bus.h"
+ #include "hw/block/flash.h"
+ #include "hw/qdev-clock.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
+ #include "hw/arm/ipod_touch.h"
+ #include "hw/arm/exynos4210.h"
+ #include "hw/dma/pl080.h"
+@@ -275,8 +277,32 @@ static void ipod_touch_set_nand_path(Object *obj, const char *value, Error **err
+     g_strlcpy(nms->nand_path, value, sizeof(nms->nand_path));
+ }
+ 
++static char *ipod_touch_get_nand_overlay_path(Object *obj, Error **errp)
++{
++    IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(obj);
++    return g_strdup(nms->nand_overlay_path);
++}
++
++static void ipod_touch_set_nand_overlay_path(Object *obj, const char *value, Error **errp)
++{
++    IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(obj);
++    g_strlcpy(nms->nand_overlay_path, value, sizeof(nms->nand_overlay_path));
++}
++
++static bool ipod_touch_get_iphone_2g(Object *obj, Error **errp)
++{
++    return IPOD_TOUCH_MACHINE(obj)->iphone_2g;
++}
++
++static void ipod_touch_set_iphone_2g(Object *obj, bool value, Error **errp)
++{
++    IPOD_TOUCH_MACHINE(obj)->iphone_2g = value;
++}
++
+ static void ipod_touch_instance_init(Object *obj)
+ {
++	object_property_add_bool(obj, "iphone-2g", ipod_touch_get_iphone_2g, ipod_touch_set_iphone_2g);
++	object_property_set_description(obj, "iphone-2g", "Experimental M68 board wiring; full iPhone OS boot is not yet verified");
+ 	object_property_add_str(obj, "bootrom", ipod_touch_get_bootrom_path, ipod_touch_set_bootrom_path);
+     object_property_set_description(obj, "bootrom", "Path to the S5L8900 bootrom binary");
+ 
+@@ -285,6 +311,9 @@ static void ipod_touch_instance_init(Object *obj)
+ 
+     object_property_add_str(obj, "nand", ipod_touch_get_nand_path, ipod_touch_set_nand_path);
+     object_property_set_description(obj, "nand", "Path to the NAND files");
++    object_property_add_str(obj, "nand-overlay", ipod_touch_get_nand_overlay_path,
++                            ipod_touch_set_nand_overlay_path);
++    object_property_set_description(obj, "nand-overlay", "Directory for separate writable NAND pages");
+ }
+ 
+ static inline qemu_irq s5l8900_get_irq(IPodTouchMachineState *s, int n)
+@@ -292,6 +321,30 @@ static inline qemu_irq s5l8900_get_irq(IPodTouchMachineState *s, int n)
+     return s->irq[n / S5L8900_VIC_SIZE][n % S5L8900_VIC_SIZE];
+ }
+ 
++static DeviceState *ipod_touch_uart_create(IPodTouchMachineState *nms,
++                                           hwaddr address, int channel,
++                                           qemu_irq irq)
++{
++    DeviceState *dev;
++    SysBusDevice *bus;
++
++    if (!nms->iphone_2g) {
++        return exynos4210_uart_create(address, 256, channel,
++                                      serial_hd(channel), irq);
++    }
++    dev = qdev_new("exynos4210.uart");
++    qdev_prop_set_chr(dev, "chardev", serial_hd(channel));
++    qdev_prop_set_uint32(dev, "channel", channel);
++    qdev_prop_set_uint32(dev, "rx-size", 256);
++    qdev_prop_set_uint32(dev, "tx-size", 256);
++    object_property_set_bool(OBJECT(dev), "s5l8900-legacy", true, &error_fatal);
++    bus = SYS_BUS_DEVICE(dev);
++    sysbus_realize_and_unref(bus, &error_fatal);
++    sysbus_mmio_map(bus, 0, address);
++    sysbus_connect_irq(bus, 0, irq);
++    return dev;
++}
++
+ static uint32_t s5l8900_usb_hwcfg[] = {
+     0,
+     0x7a8f60d0,
+@@ -305,6 +358,21 @@ static void ipod_touch_key_event(void *opaque, int keycode)
+     int gpio_group = 0, gpio_selector = 0;
+ 
+     IPodTouchMultitouchState *s = (IPodTouchMultitouchState *)opaque;
++    if (s->sysic->iphone_2g &&
++        (keycode == 25 || keycode == 153 || keycode == 35 || keycode == 163)) {
++        bool home = keycode == 35 || keycode == 163;
++        bool high = keycode == 25 || keycode == 35;
++        unsigned pin = (home ? s->gpio_home_pin : GPIO_BUTTON_POWER) & 0xf;
++        unsigned interrupt = home ? s->gpio_home_irq : GPIO_BUTTON_POWER_IRQ;
++
++        /* The original M68 DT registers Home/Power with flags 7:
++         * high-level interrupts with guest-managed polarity auto-flip.
++         */
++        s->gpio_state->gpio_state = (s->gpio_state->gpio_state & ~(1U << pin)) |
++                                    ((unsigned)high << pin);
++        ipod_touch_sysic_gpio_input(s->sysic, interrupt, high);
++        return;
++    }
+     if(keycode == 25 || keycode == 153) {
+         // power button
+         gpio_group = GPIO_BUTTON_POWER_IRQ / NUM_GPIO_PINS;
+@@ -321,15 +389,15 @@ static void ipod_touch_key_event(void *opaque, int keycode)
+     }
+     else if(keycode == 35 || keycode == 163) {
+         // home button
+-        gpio_group = GPIO_BUTTON_HOME_IRQ / NUM_GPIO_PINS;
+-        gpio_selector = GPIO_BUTTON_HOME_IRQ % NUM_GPIO_PINS;
++        gpio_group = s->gpio_home_irq / NUM_GPIO_PINS;
++        gpio_selector = s->gpio_home_irq % NUM_GPIO_PINS;
+ 
+-        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (GPIO_BUTTON_HOME & 0xf))) == 0) {
+-            s->gpio_state->gpio_state |= (1 << (GPIO_BUTTON_HOME & 0xf));
++        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (s->gpio_home_pin & 0xf))) == 0) {
++            s->gpio_state->gpio_state |= (1 << (s->gpio_home_pin & 0xf));
+             do_irq = true;
+         }
+         else if(keycode == 163) {
+-            s->gpio_state->gpio_state &= ~(1 << (GPIO_BUTTON_HOME & 0xf));
++            s->gpio_state->gpio_state &= ~(1 << (s->gpio_home_pin & 0xf));
+             do_irq = true;
+         }
+     }
+@@ -389,6 +457,7 @@ static void ipod_touch_machine_init(MachineState *machine)
+     // init the timer
+     dev = qdev_new("ipodtouch.timer");
+     IPodTouchTimerState *timer_state = IPOD_TOUCH_TIMER(dev);
++    timer_state->s5l8900_legacy = nms->iphone_2g;
+     nms->timer1 = timer_state;
+     memory_region_add_subregion(sysmem, TIMER1_MEM_BASE, &timer_state->iomem);
+     SysBusDevice *busdev = SYS_BUS_DEVICE(dev);
+@@ -398,24 +467,28 @@ static void ipod_touch_machine_init(MachineState *machine)
+     // init sysic
+     dev = qdev_new("ipodtouch.sysic");
+     IPodTouchSYSICState *sysic_state = IPOD_TOUCH_SYSIC(dev);
+-    nms->sysic = (IPodTouchSYSICState *) g_malloc0(sizeof(struct IPodTouchSYSICState));
++    sysic_state->iphone_2g = nms->iphone_2g;
++    nms->sysic = sysic_state;
+     memory_region_add_subregion(sysmem, SYSIC_MEM_BASE, &sysic_state->iomem);
+     busdev = SYS_BUS_DEVICE(dev);
+     for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
+         sysbus_connect_irq(busdev, grp, s5l8900_get_irq(nms, S5L8900_GPIO_IRQS[grp]));
+     }
+ 
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G0_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G1_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G2_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G3_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G4_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G5_IRQ));
+-    sysbus_connect_irq(busdev, 0, s5l8900_get_irq(nms, S5L8900_GPIO_G6_IRQ));
+ 
+     // init GPIO
+     dev = qdev_new("ipodtouch.gpio");
+     IPodTouchGPIOState *gpio_state = IPOD_TOUCH_GPIO(dev);
++    gpio_state->iphone_2g = nms->iphone_2g;
++    if (nms->iphone_2g) {
++        /* Home/Power/Ringer are high-active; volume inputs are low-active. */
++        gpio_state->gpio_state = (1U << 1) | (1U << 2);
++        ipod_touch_sysic_gpio_input(sysic_state, 0x28, false);
++        ipod_touch_sysic_gpio_input(sysic_state, 0x29, true);
++        ipod_touch_sysic_gpio_input(sysic_state, 0x2a, true);
++        ipod_touch_sysic_gpio_input(sysic_state, 0x2b, false);
++        ipod_touch_sysic_gpio_input(sysic_state, GPIO_BUTTON_POWER_IRQ, false);
++    }
+     nms->gpio_state = gpio_state;
+     memory_region_add_subregion(sysmem, GPIO_MEM_BASE, &gpio_state->iomem);
+ 
+@@ -425,31 +498,37 @@ static void ipod_touch_machine_init(MachineState *machine)
+     nms->sdio_state = sdio_state;
+     memory_region_add_subregion(sysmem, SDIO_MEM_BASE, &sdio_state->iomem);
+ 
+-    dev = exynos4210_uart_create(UART0_MEM_BASE, 256, 0, serial_hd(0), nms->irq[0][24]);
++    dev = ipod_touch_uart_create(nms, UART0_MEM_BASE, 0, nms->irq[0][24]);
+     if (!dev) {
+         printf("Failed to create uart0 device!\n");
+         abort();
+     }
+ 
+-    dev = exynos4210_uart_create(UART1_MEM_BASE, 256, 1, serial_hd(1), nms->irq[0][25]);
++    dev = ipod_touch_uart_create(nms, UART1_MEM_BASE, 1, nms->irq[0][25]);
+     if (!dev) {
+         printf("Failed to create uart1 device!\n");
+         abort();
+     }
++    /* A modeled attached UART peer may accept TX without supplying radio
++     * replies. iBoot159 then follows its bounded absent-NVRAM timeout path.
++     */
++    if (nms->iphone_2g) {
++        qemu_set_irq(qdev_get_gpio_in_named(dev, "cts", 0), 1);
++    }
+ 
+-    dev = exynos4210_uart_create(UART2_MEM_BASE, 256, 2, serial_hd(2), nms->irq[0][26]);
++    dev = ipod_touch_uart_create(nms, UART2_MEM_BASE, 2, nms->irq[0][26]);
+     if (!dev) {
+         printf("Failed to create uart2 device!\n");
+         abort();
+     }
+ 
+-    dev = exynos4210_uart_create(UART3_MEM_BASE, 256, 3, serial_hd(3), nms->irq[0][27]);
++    dev = ipod_touch_uart_create(nms, UART3_MEM_BASE, 3, nms->irq[0][27]);
+     if (!dev) {
+         printf("Failed to create uart3 device!\n");
+         abort();
+     }
+ 
+-    dev = exynos4210_uart_create(UART4_MEM_BASE, 256, 4, serial_hd(4), nms->irq[0][28]);
++    dev = ipod_touch_uart_create(nms, UART4_MEM_BASE, 4, nms->irq[0][28]);
+     if (!dev) {
+         printf("Failed to create uart4 device!\n");
+         abort();
+@@ -468,6 +547,14 @@ static void ipod_touch_machine_init(MachineState *machine)
+     spi2_state->mt->sysic = sysic_state;
+     spi2_state->mt->gpio_state = gpio_state;
+     nms->spi2_state = spi2_state;
++    spi2_state->mt->zephyr1 = nms->iphone_2g;
++    spi2_state->mt->gpio_attention = nms->iphone_2g ? 0xa3 : 0x9b;
++    spi2_state->mt->gpio_home_pin = nms->iphone_2g ? 0x1600 : GPIO_BUTTON_HOME;
++    spi2_state->mt->gpio_home_irq = nms->iphone_2g ? 0x28 : GPIO_BUTTON_HOME_IRQ;
++    if (nms->iphone_2g) {
++        qdev_connect_gpio_out_named(DEVICE(gpio_state), "multitouch-cs", 0,
++            qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0));
++    }
+ 
+     ipod_touch_memory_setup(machine, sysmem, nsas);
+ 
+@@ -502,7 +589,12 @@ static void ipod_touch_machine_init(MachineState *machine)
+     // init NAND flash
+     dev = qdev_new("itnand");
+     ITNandState *nand_state = ITNAND(dev);
+-    nand_state->nand_path = &nms->nand_path;
++    nand_state->nand_path = nms->nand_path;
++    object_property_set_uint(OBJECT(dev), "erased-page-fill", nms->iphone_2g ? 0xff : 0, &error_fatal);
++    object_property_set_uint(OBJECT(dev), "bank-mask", nms->iphone_2g ? 0x0f : 0xff, &error_fatal);
++    if (nms->nand_overlay_path[0]) {
++        object_property_set_str(OBJECT(dev), "nand-overlay", nms->nand_overlay_path, &error_fatal);
++    }
+     nms->nand_state = nand_state;
+     memory_region_add_subregion(sysmem, NAND_MEM_BASE, &nand_state->iomem);
+ 
+@@ -564,6 +656,7 @@ static void ipod_touch_machine_init(MachineState *machine)
+     // init two pl080 DMAC0 devices
+     dev = qdev_new("pl080");
+     PL080State *pl080_1 = PL080(dev);
++    object_property_set_bool(OBJECT(dev), "s5l8900-uncached-alias", nms->iphone_2g, &error_fatal);
+     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+     memory_region_add_subregion(sysmem, DMAC0_MEM_BASE, &pl080_1->iomem);
+     busdev = SYS_BUS_DEVICE(dev);
+@@ -572,6 +665,7 @@ static void ipod_touch_machine_init(MachineState *machine)
+ 
+     dev = qdev_new("pl080");
+     PL080State *pl080_2 = PL080(dev);
++    object_property_set_bool(OBJECT(dev), "s5l8900-uncached-alias", nms->iphone_2g, &error_fatal);
+     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+     memory_region_add_subregion(sysmem, DMAC1_MEM_BASE, &pl080_2->iomem);
+     busdev = SYS_BUS_DEVICE(dev);
+@@ -597,11 +691,14 @@ static void ipod_touch_machine_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, I2C1_MEM_BASE, &i2c_state->iomem);
+ 
+     // init the PMU
+-    I2CSlave *pmu = i2c_slave_create_simple(i2c_state->bus, "pcf50633", 0x73);
++    I2CBus *pmu_bus = nms->iphone_2g ? nms->i2c0_state->bus : nms->i2c1_state->bus;
++    I2CSlave *pmu = i2c_slave_create_simple(pmu_bus, "pcf50633", 0x73);
++    PCF50633(pmu)->battery_adc_ready = nms->iphone_2g;
+ 
+     // init the ADM
+     dev = qdev_new("ipodtouch.adm");
+     IPodTouchADMState *adm_state = IPOD_TOUCH_ADM(dev);
++    object_property_set_bool(OBJECT(dev), "m68-layout", nms->iphone_2g, &error_fatal);
+     adm_state->nand_state = nand_state;
+     nms->adm_state = adm_state;
+     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+@@ -642,10 +739,15 @@ static void ipod_touch_machine_init(MachineState *machine)
+     nms->tvout3_state = tvout_state;
+     memory_region_add_subregion(sysmem, TVOUT3_MEM_BASE, &tvout_state->iomem);
+ 
+-    // setup workaround for TVOut
+-    iomem = g_new(MemoryRegion, 1);
+-    memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL, "tvoutworkaround", 0x4);
+-    memory_region_add_subregion(sysmem, TVOUT_WORKAROUND_MEM_BASE, iomem);
++    /* The upstream TVOut workaround shadows a particular N45 heap word.
++     * Preserve it for that reference profile; M68 needs its actual RAM here.
++     */
++    if (!nms->iphone_2g) {
++        iomem = g_new(MemoryRegion, 1);
++        memory_region_init_io(iomem, OBJECT(nms), &tvout_workaround_ops, NULL,
++                              "tvoutworkaround", 0x4);
++        memory_region_add_subregion(sysmem, TVOUT_WORKAROUND_MEM_BASE, iomem);
++    }
+ 
+     qemu_register_reset(ipod_touch_cpu_reset, nms);
+ 
+diff --git a/hw/arm/ipod_touch_adm.c b/hw/arm/ipod_touch_adm.c
+index 390309f19d17236e058fd0fbfb4d7531a410d0fa..88fb35e7e7c0ada7e80a9dc563a29fced1c30f19 100644
+--- a/hw/arm/ipod_touch_adm.c
++++ b/hw/arm/ipod_touch_adm.c
+@@ -2,6 +2,126 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/arm/ipod_touch_nand.h"
+ #include "qapi/error.h"
++#include "qemu/bswap.h"
++
++static void adm_read_buffer(IPodTouchADMState *s, hwaddr address,
++                           void *buffer, size_t length)
++{
++    if (address_space_read(&s->downstream_as, address,
++                           MEMTXATTRS_UNSPECIFIED, buffer, length) != MEMTX_OK) {
++        hw_error("ADM: unmapped descriptor read at 0x%" HWADDR_PRIx, address);
++    }
++}
++
++static void adm_write_buffer(IPodTouchADMState *s, hwaddr address,
++                            const void *buffer, size_t length)
++{
++    if (address_space_write(&s->downstream_as, address,
++                            MEMTXATTRS_UNSPECIFIED, buffer, length) != MEMTX_OK) {
++        hw_error("ADM: unmapped response write at 0x%" HWADDR_PRIx, address);
++    }
++}
++
++static unsigned adm_available_bank_count(IPodTouchADMState *s)
++{
++    unsigned count = 0;
++    unsigned bank;
++
++    for (bank = 0; bank < NAND_NUM_BANKS; bank++) {
++        count += (s->nand_state->bank_mask >> bank) & 1;
++    }
++    return count;
++}
++
++static void adm_validate_page_count(IPodTouchADMState *s, unsigned count,
++                                   bool interleaved)
++{
++    unsigned banks = adm_available_bank_count(s);
++
++    if (!count || count > ARRAY_SIZE(s->nand_state->pages_to_read) ||
++        (interleaved && (!banks || count % banks))) {
++        hw_error("ADM: unsupported page count %u%s", count,
++                 interleaved ? " for interleaved read" : "");
++    }
++}
++
++static void adm_validate_bank(IPodTouchADMState *s, unsigned bank)
++{
++    if (bank >= NAND_NUM_BANKS ||
++        !(s->nand_state->bank_mask & (1U << bank))) {
++        hw_error("ADM: invalid NAND bank %u", bank);
++    }
++}
++
++static void adm_validate_page(uint32_t page)
++{
++    if (page >= NAND_PAGES_PER_BANK) {
++        hw_error("ADM: invalid NAND page %u", page);
++    }
++}
++
++static bool adm_bytes_erased(const uint8_t *bytes, size_t length)
++{
++    size_t i;
++
++    for (i = 0; i < length; i++) {
++        if (bytes[i] != 0xff) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool adm_page_erased(const uint8_t *data, const uint8_t *spare)
++{
++    return adm_bytes_erased(data, NAND_BYTES_PER_PAGE) &&
++           adm_bytes_erased(spare, NAND_BYTES_PER_SPARE);
++}
++
++static unsigned adm_m68_spare_stride(IPodTouchADMState *s, hwaddr packet_base)
++{
++    uint8_t bytes[2];
++    unsigned stride;
++
++    /* c0425180-c0425198 writes the caller's spare record size here;
++     * c042578c-c04257a8 copies count*size bytes from section3 unchanged.
++     */
++    adm_read_buffer(s, packet_base + 0x2c, bytes, sizeof(bytes));
++    stride = lduw_be_p(bytes);
++    if (stride > NAND_BYTES_PER_SPARE) {
++        hw_error("ADM: unsupported M68 spare record size %u", stride);
++    }
++    return stride;
++}
++
++static void adm_write_multi_spares(IPodTouchADMState *s, hwaddr packet_base,
++                                    unsigned count)
++{
++    unsigned stride = s->m68_layout ?
++                      adm_m68_spare_stride(s, packet_base) : 0xc;
++    bool all_erased = true;
++    unsigned i;
++
++    for (i = 0; i < count; i++) {
++        uint8_t data[NAND_BYTES_PER_PAGE];
++        uint8_t spare[NAND_BYTES_PER_SPARE] = {0};
++
++        if (s->m68_layout) {
++            nand_read_page(s->nand_state, s->nand_state->banks_to_read[i],
++                           s->nand_state->pages_to_read[i], data, spare);
++            all_erased &= adm_page_erased(data, spare);
++        } else {
++            spare[10] = 0xff;
++        }
++        if (stride) {
++            adm_write_buffer(s, (hwaddr)s->data3_sec_addr + i * stride,
++                             spare, stride);
++        }
++    }
++    if (s->m68_layout && all_erased) {
++        s->completion[2] = 0xfe;
++    }
++}
+ 
+ static void set_bank(ITNandState *s, uint8_t activate_bank) {
+     for(int bank = 0; bank < 8; bank++) {
+@@ -15,7 +135,16 @@ static void set_bank(ITNandState *s, uint8_t activate_bank) {
+ 
+ static uint64_t ipod_touch_adm_read(void *opaque, hwaddr offset, unsigned size)
+ {
+-    //IPodTouchADMState *s = (IPodTouchADMState *)opaque;
++    IPodTouchADMState *s = opaque;
++
++    /* c0422d00-c0422d10 reads four MMIO words into four halfword results.
++     * _fmcPerformPartialIO recognizes result[2]==0xfe as an empty read
++     * (c0424b40-c0424b48); all other modeled successful results are zero.
++     */
++    if (s->m68_layout && offset >= 0x30 && offset <= 0x3c &&
++        !(offset & 3)) {
++        return s->completion[(offset - 0x30) / 4];
++    }
+ 
+     //fprintf(stderr, "s5l8900_adm_read(): offset = 0x%08x\n", offset);
+ 
+@@ -34,6 +163,13 @@ static uint64_t ipod_touch_adm_read(void *opaque, hwaddr offset, unsigned size)
+ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+ {
+     IPodTouchADMState *s = (IPodTouchADMState *)opaque;
++    /* Original 1A543a initializes its command structure at section2+0x824
++     * (c0425e40-c0425e54); its page vector begins at structure+0x444
++     * (c0425680-c0425698). Preserve the neighboring N45 layout by default.
++     */
++    hwaddr packet_base = (hwaddr)s->data2_sec_addr +
++                         (s->m68_layout ? 0x824 : 0x1104);
++    unsigned page_vector_offset = s->m68_layout ? 0x444 : 0x244;
+ 
+     //fprintf(stderr, "s5l8900_adm_write: offset = 0x%08x, val = 0x%08x\n", offset, value);
+ 
+@@ -42,57 +178,73 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
+             if(value == 0x3) {
+                 // some kind of start-up command?
+                 // write some bits to data2_sec_addr to indicate that the device is started
+-                uint32_t *data = (uint32_t *) malloc(sizeof(uint32_t));
++                uint32_t data[8] = {0};
+                 data[0] = 0x50;
+-                address_space_rw(&s->downstream_as, s->data2_sec_addr, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, 4, 1);
++                adm_write_buffer(s, s->data2_sec_addr, (uint8_t *)data, 4);
+ 
+                 // dunno, write some bytes to data4_sec_addr to indicate that the NAND banks are ready
+-                data = (uint32_t *) malloc(sizeof(uint32_t) * 8);
+-                for(int i = 0; i < 8; i++) {
+-                    data[i] = NAND_CHIP_ID;
++                for(int i = 0; i < NAND_NUM_BANKS; i++) {
++                    data[i] = (s->nand_state->bank_mask & (1U << i)) ?
++                              NAND_CHIP_ID : UINT32_MAX;
+                 }
+                 
+-                address_space_rw(&s->downstream_as, s->data3_sec_addr, MEMTXATTRS_UNSPECIFIED, (uint8_t *)data, 8 * sizeof(uint32_t), 1);
++                adm_write_buffer(s, s->data3_sec_addr, (uint8_t *)data, 8 * sizeof(uint32_t));
+             }
+             break;
+         case ADM_CTRL2:
+             if(value == 0x2) {
++                memset(s->completion, 0, sizeof(s->completion));
+                 // read the command and initialize the right device
+                 uint32_t page;
+                 uint16_t num_pages;
+                 uint8_t bank;
+-                uint32_t *buf = malloc(80);
+-                address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x24, MEMTXATTRS_UNSPECIFIED, buf, 80);
+-                int cmd = *buf;
++                uint8_t scratch[4] = {0};
++                uint8_t *buf = scratch;
++                adm_read_buffer(s, packet_base + 0x24, buf,
++                                s->m68_layout ? 2 : 4);
++                unsigned cmd = s->m68_layout ? lduw_le_p(buf) : ldl_le_p(buf);
+                 // printf("Setting command: 0x%08x\n", cmd);
+                 // for(int i = 0; i < 20; i++) {
+                 //     printf("0x%08x ", buf[i]);
+                 // }
+                 // printf("\n");
+                 switch(cmd) {
++                    case 0x100:
++                        if (s->m68_layout) {
++                            /* c0425074-c04250b0 submits this command and
++                             * checks only the completion result. It carries
++                             * no page/FIFO transfer in the original driver.
++                             */
++                            break;
++                        }
++                        printf("Unrecognized ADM command: %u\n", cmd);
++                        break;
+                     case 0x200:
+                         // read multiple pages simultaneously from the same bank
+                         s->nand_state->reading_multiple_pages = true;
+-                        buf = malloc(2);
+-                        address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x28, MEMTXATTRS_UNSPECIFIED, buf, 2);
+-                        num_pages = *(uint16_t*)buf;
+-                        num_pages = ( (((num_pages) >> 8) & 0x00FF) | (((num_pages) << 8) & 0xFF00) ); // swap endianness
++                        adm_read_buffer(s, packet_base + 0x28, buf, 2);
++                        num_pages = lduw_be_p(buf);
+                         //printf("Reading %d pages at once, ", num_pages);
+ 
+-                        buf = malloc(4);
+-                        address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x244, MEMTXATTRS_UNSPECIFIED, buf, 4);
+-                        page = *buf;
+-                        page = ((page>>24)&0xff) | // move byte 3 to byte 0
+-                               ((page<<8)&0xff0000) | // move byte 1 to byte 2
+-                               ((page>>8)&0xff00) | // move byte 2 to byte 1
+-                               ((page<<24)&0xff000000); // byte 0 to byte 3
++                        adm_read_buffer(s, packet_base + page_vector_offset, buf, 4);
++                        page = ldl_be_p(buf);
++                        adm_validate_page(page);
+                         //printf("starting with page %d\n", page);
+ 
+-                        uint16_t ops = num_pages / 8;
++                        adm_validate_page_count(s, num_pages, true);
++                        unsigned bank_count = adm_available_bank_count(s);
++                        uint16_t ops = num_pages / bank_count;
++                        if (ops > NAND_PAGES_PER_BANK - page) {
++                            hw_error("ADM: interleaved read exceeds NAND bank");
++                        }
+                         for(int op = 0; op < ops; op++) {
+-                            for(int i = 0; i < 8; i++) {
+-                                s->nand_state->pages_to_read[op * 8 + i] = page;
+-                                s->nand_state->banks_to_read[op * 8 + i] = i;
++                            unsigned index = op * bank_count;
++
++                            for(int i = 0; i < NAND_NUM_BANKS; i++) {
++                                if (s->nand_state->bank_mask & (1U << i)) {
++                                    s->nand_state->pages_to_read[index] = page;
++                                    s->nand_state->banks_to_read[index++] = i;
++                                }
+                             }
+                             page++;
+                         }
+@@ -100,32 +252,24 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
+                         s->nand_state->fmdnum = (num_pages * 0x800);
+                         s->nand_state->cur_bank_reading = -1;
+ 
+-                        for(int i = 0; i < num_pages; i++) {
+-                            uint8_t *sbuf = malloc(0xC);
+-                            sbuf[10] = 0xFF;
+-                            address_space_rw(&s->downstream_as, s->data3_sec_addr + i * 0xC, MEMTXATTRS_UNSPECIFIED, sbuf, 0xC, 1);
+-                        }
++                        adm_write_multi_spares(s, packet_base, num_pages);
+                         
+                         break;
+                     case 0x300:
+                         // seems to be the NAND read command, read the page(s) + bank and instruct the flash device
+                         s->nand_state->reading_multiple_pages = false;
+-                        buf = malloc(2);
+-                        address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x28, MEMTXATTRS_UNSPECIFIED, buf, 2);
+-                        num_pages = *(uint16_t*)buf;
+-                        num_pages = ( (((num_pages) >> 8) & 0x00FF) | (((num_pages) << 8) & 0xFF00) ); // swap endianness
++                        adm_read_buffer(s, packet_base + 0x28, buf, 2);
++                        num_pages = lduw_be_p(buf);
++                        adm_validate_page_count(s, num_pages, false);
+                         if(num_pages == 1) {
+                             // TODO this can probably be refactored to re-use the logic to read multiple pages!
+-                            address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x44, MEMTXATTRS_UNSPECIFIED, buf, 1);
+-                            bank = *(uint8_t*)buf;
+-
+-                            buf = malloc(4);
+-                            address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x244, MEMTXATTRS_UNSPECIFIED, buf, 4);
+-                            page = *buf;
+-                            page = ((page>>24)&0xff) | // move byte 3 to byte 0
+-                                   ((page<<8)&0xff0000) | // move byte 1 to byte 2
+-                                   ((page>>8)&0xff00) | // move byte 2 to byte 1
+-                                   ((page<<24)&0xff000000); // byte 0 to byte 3
++                            adm_read_buffer(s, packet_base + 0x44, buf, 1);
++                            bank = buf[0];
++                            adm_validate_bank(s, bank);
++
++                            adm_read_buffer(s, packet_base + page_vector_offset, buf, 4);
++                            page = ldl_be_p(buf);
++                            adm_validate_page(page);
+                             //printf("Reading single page: %d (bank: %d)\n", page, bank);
+ 
+                             // set the bank, page, and operation.
+@@ -137,24 +281,32 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
+ 
+                             // write the spare of the page to the 3rd data section
+                             nand_set_buffered_page(s->nand_state, page);
+-                            address_space_rw(&s->downstream_as, s->data3_sec_addr, MEMTXATTRS_UNSPECIFIED, (uint8_t *)s->nand_state->page_spare_buffer, NAND_BYTES_PER_SPARE, 1);
++                            if (s->m68_layout &&
++                                adm_page_erased(s->nand_state->page_buffer,
++                                                s->nand_state->page_spare_buffer)) {
++                                s->completion[2] = 0xfe;
++                            }
++                            unsigned spare_stride = s->m68_layout ?
++                                adm_m68_spare_stride(s, packet_base) :
++                                NAND_BYTES_PER_SPARE;
++                            if (spare_stride) {
++                                adm_write_buffer(s, s->data3_sec_addr,
++                                    s->nand_state->page_spare_buffer,
++                                    spare_stride);
++                            }
+                         }
+                         else if(num_pages > 1) {
+                             // read scattered pages
+                             // printf("Reading %d scattered pages\n", num_pages);
+                             s->nand_state->reading_multiple_pages = true;
+                             for(int i = 0; i < num_pages; i++) {
+-                                buf = malloc(4);
+-                                address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x244 + 4 * i, MEMTXATTRS_UNSPECIFIED, buf, 4);
+-                                page = *buf;
+-                                page = ((page>>24)&0xff) | // move byte 3 to byte 0
+-                                       ((page<<8)&0xff0000) | // move byte 1 to byte 2
+-                                       ((page>>8)&0xff00) | // move byte 2 to byte 1
+-                                       ((page<<24)&0xff000000); // byte 0 to byte 3
+-
+-                                buf = malloc(1);
+-                                address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x44 + i, MEMTXATTRS_UNSPECIFIED, buf, 1);
+-                                bank = *(uint8_t*)buf;
++                                adm_read_buffer(s, packet_base + page_vector_offset + 4 * i, buf, 4);
++                                page = ldl_be_p(buf);
++                                adm_validate_page(page);
++
++                                adm_read_buffer(s, packet_base + 0x44 + i, buf, 1);
++                                bank = buf[0];
++                                adm_validate_bank(s, bank);
+                                 // printf("Page: %d, bank: %d\n", page, bank);
+ 
+                                 s->nand_state->pages_to_read[i] = page;
+@@ -164,36 +316,55 @@ static void ipod_touch_adm_write(void *opaque, hwaddr offset, uint64_t value, un
+                             s->nand_state->fmdnum = (num_pages * 0x800);
+                             s->nand_state->cur_bank_reading = -1;
+ 
+-                            for(int i = 0; i < num_pages; i++) {
+-                                uint8_t *sbuf = malloc(0xC);
+-                                sbuf[10] = 0xFF;
+-                                address_space_rw(&s->downstream_as, s->data3_sec_addr + i * 0xC, MEMTXATTRS_UNSPECIFIED, sbuf, 0xC, 1);
+-                            }
++                            adm_write_multi_spares(s, packet_base, num_pages);
+                         }
+                         break;
+                     case 0x500:
+                         // writing a page
+-                        buf = malloc(1);
+-                        address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x44, MEMTXATTRS_UNSPECIFIED, buf, 1);
+-                        bank = *(uint8_t*)buf;
+-
+-                        buf = malloc(4);
+-                        address_space_read(&s->downstream_as, s->data2_sec_addr + 0x1104 + 0x244, MEMTXATTRS_UNSPECIFIED, buf, 4);
+-                        page = *buf;
+-                        page = ((page>>24)&0xff) | // move byte 3 to byte 0
+-                               ((page<<8)&0xff0000) | // move byte 1 to byte 2
+-                               ((page>>8)&0xff00) | // move byte 2 to byte 1
+-                               ((page<<24)&0xff000000); // byte 0 to byte 3
++                        if (s->m68_layout) {
++                            adm_read_buffer(s, packet_base + 0x28, buf, 2);
++                            num_pages = lduw_be_p(buf);
++                            if (num_pages != 1) {
++                                hw_error("ADM: unsupported M68 write count %u",
++                                         num_pages);
++                            }
++                        }
++                        adm_read_buffer(s, packet_base + 0x44, buf, 1);
++                        bank = buf[0];
++                        adm_validate_bank(s, bank);
++
++                        adm_read_buffer(s, packet_base + page_vector_offset, buf, 4);
++                        page = ldl_be_p(buf);
++                        adm_validate_page(page);
+ 
+                         // set the bank, page, and operation.
+                         //printf("Activating bank for writing: %d, page: %d\n", bank, page);
+                         set_bank(s->nand_state, bank);
+                         nand_set_buffered_page(s->nand_state, page);
++                        if (s->m68_layout) {
++                            unsigned spare_stride =
++                                adm_m68_spare_stride(s, packet_base);
++
++                            /* The original write path copies caller metadata
++                             * to section3 before submitting (c04256c8-c04256e4).
++                             * Persist that metadata with the ensuing page data.
++                             */
++                            memset(s->nand_state->page_spare_buffer, 0xff,
++                                   NAND_BYTES_PER_SPARE);
++                            if (spare_stride) {
++                                adm_read_buffer(s, s->data3_sec_addr,
++                                    s->nand_state->page_spare_buffer,
++                                    spare_stride);
++                            }
++                        }
+                         s->nand_state->fmdnum = NAND_BYTES_PER_PAGE;
+                         s->nand_state->is_writing = true;
+                         break;
+                     default:
+-                        printf("Unrecognized ADM command: %d\n", cmd);
++                        if (s->m68_layout) {
++                            hw_error("ADM: unsupported M68 command 0x%x", cmd);
++                        }
++                        printf("Unrecognized ADM command: %u\n", cmd);
+                         break;
+                 }
+                 qemu_irq_raise(s->irq);
+@@ -225,6 +396,13 @@ static const MemoryRegionOps ipod_touch_adm_ops = {
+     .endianness = DEVICE_NATIVE_ENDIAN,
+ };
+ 
++static void ipod_touch_adm_reset(DeviceState *dev)
++{
++    IPodTouchADMState *s = IPOD_TOUCH_ADM(dev);
++
++    memset(s->completion, 0, sizeof(s->completion));
++}
++
+ static void ipod_touch_adm_realize(DeviceState *dev, Error **errp)
+ {
+     IPodTouchADMState *s = IPOD_TOUCH_ADM(dev);
+@@ -238,6 +416,7 @@ static void ipod_touch_adm_realize(DeviceState *dev, Error **errp)
+ }
+ 
+ static Property adm_properties[] = {
++    DEFINE_PROP_BOOL("m68-layout", IPodTouchADMState, m68_layout, false),
+     DEFINE_PROP_LINK("downstream", IPodTouchADMState, downstream,
+                      TYPE_MEMORY_REGION, MemoryRegion *),
+     DEFINE_PROP_END_OF_LIST(),
+@@ -257,6 +436,7 @@ static void ipod_touch_adm_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+     dc->realize = ipod_touch_adm_realize;
++    dc->reset = ipod_touch_adm_reset;
+     device_class_set_props(dc, adm_properties);
+ }
+ 
+diff --git a/hw/arm/ipod_touch_gpio.c b/hw/arm/ipod_touch_gpio.c
+index 6cca0dddd6ef0651f1dd12faf2c442c0f726ecd0..72ca64274288bc6edb68aa632aa4d8c75bfd3a06 100644
+--- a/hw/arm/ipod_touch_gpio.c
++++ b/hw/arm/ipod_touch_gpio.c
+@@ -1,4 +1,5 @@
+ #include "hw/arm/ipod_touch_gpio.h"
++#include "hw/irq.h"
+ 
+ static void s5l8900_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+ {
+@@ -6,6 +7,22 @@ static void s5l8900_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsign
+     IPodTouchGPIOState *s = (struct IPodTouchGPIOState *) opaque;
+ 
+     switch(addr) {
++        case 0x320: {
++            unsigned port = (value >> 16) & 0x1f;
++            unsigned pin = (value >> 8) & 0x7;
++            unsigned mode = value & 0xf;
++            s->function_select = value;
++            if ((mode & 0xe) == 0xe) {
++                bool high = (mode & 1) != 0;
++                s->port_data[port] = (s->port_data[port] & ~(1U << pin)) |
++                                     ((unsigned)high << pin);
++                /* Original M68 SPI2 chip select is GPIO 0x705. */
++                if (s->iphone_2g && port == 7 && pin == 5) {
++                    qemu_set_irq(s->multitouch_cs, high);
++                }
++            }
++            break;
++        }
+       default:
+         break;
+     }
+@@ -17,9 +34,14 @@ static uint64_t s5l8900_gpio_read(void *opaque, hwaddr addr, unsigned size)
+     IPodTouchGPIOState *s = (struct IPodTouchGPIOState *) opaque;
+ 
+     switch(addr) {
++        case 0x320:
++            return s->function_select;
+         case 0x2c4:
+             return s->gpio_state; 
+         default:
++            if (addr < 32 * 0x20 && (addr & 0x1f) == 4) {
++                return s->port_data[addr >> 5];
++            }
+             break;
+     }
+ 
+@@ -39,6 +61,7 @@ static void s5l8900_gpio_init(Object *obj)
+     IPodTouchGPIOState *s = IPOD_TOUCH_GPIO(dev);
+ 
+     memory_region_init_io(&s->iomem, obj, &gpio_ops, s, "gpio", 0x10000);
++    qdev_init_gpio_out_named(dev, &s->multitouch_cs, "multitouch-cs", 1);
+ }
+ 
+ static void s5l8900_gpio_class_init(ObjectClass *klass, void *data)
+@@ -59,4 +82,4 @@ static void ipod_touch_machine_types(void)
+     type_register_static(&ipod_touch_gpio_info);
+ }
+ 
+-type_init(ipod_touch_machine_types)
+\ No newline at end of file
++type_init(ipod_touch_machine_types)
+diff --git a/hw/arm/ipod_touch_lcd.c b/hw/arm/ipod_touch_lcd.c
+index f6a3bc63c42445035dc18b39f5d859fbfb8791ed..9a2e98193be5461bf8ab6b4e9b9d21c14367b576 100644
+--- a/hw/arm/ipod_touch_lcd.c
++++ b/hw/arm/ipod_touch_lcd.c
+@@ -1,8 +1,17 @@
+ #include "hw/arm/ipod_touch_lcd.h"
++#include "qemu/units.h"
+ #include "ui/pixel_ops.h"
+ #include "ui/console.h"
+ #include "hw/display/framebuffer.h"
+ 
++#define LCD_INT_FRAME_DONE 1u
++
++static void s5l8900_lcd_update_irq(IPodTouchLCDState *s)
++{
++    /* 0x14 enables interrupt sources; 0x18 contains pending sources. */
++    qemu_set_irq(s->irq, (s->unknown1 & s->unknown2) != 0);
++}
++
+ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     // fprintf(stderr, "%s: read from location 0x%08x\n", __func__, addr);
+@@ -58,6 +67,28 @@ static uint64_t s5l8900_lcd_read(void *opaque, hwaddr addr, unsigned size)
+             return s->w2_display_resolution_info;
+         case 0x80:
+             return s->w2_qlen;
++
++        case 0x88:
++            return s->w3_hspan;
++        case 0x8c:
++            return s->w3_display_depth_info;
++        case 0x90:
++            return s->w3_framebuffer_base;
++        case 0x94:
++            return s->w3_display_resolution_info;
++        case 0x98:
++            return s->w3_qlen;
++
++        case 0xa0:
++            return s->w4_hspan;
++        case 0xa4:
++            return s->w4_display_depth_info;
++        case 0xa8:
++            return s->w4_framebuffer_base;
++        case 0xac:
++            return s->w4_display_resolution_info;
++        case 0xb0:
++            return s->w4_qlen;
+         default:
+             // hw_error("%s: read invalid location 0x%08x.\n", __func__, addr);
+             break;
+@@ -80,10 +111,12 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned
+ 
+         case 0x14:
+             s->unknown1 = val;
++            s5l8900_lcd_update_irq(s);
+             break;
+         case 0x18:
+-            s->unknown2 = val;
+-            qemu_irq_lower(s->irq);
++            /* The CLCD driver acknowledges pending sources by writing ones. */
++            s->unknown2 &= ~val;
++            s5l8900_lcd_update_irq(s);
+             break;
+ 
+         case 0x20:
+@@ -141,6 +174,38 @@ static void s5l8900_lcd_write(void *opaque, hwaddr addr, uint64_t val, unsigned
+         case 0x80:
+             s->w2_qlen = val;
+             break;
++
++        case 0x88:
++            s->w3_hspan = val;
++            break;
++        case 0x8c:
++            s->w3_display_depth_info = val;
++            break;
++        case 0x90:
++            s->w3_framebuffer_base = val;
++            break;
++        case 0x94:
++            s->w3_display_resolution_info = val;
++            break;
++        case 0x98:
++            s->w3_qlen = val;
++            break;
++
++        case 0xa0:
++            s->w4_hspan = val;
++            break;
++        case 0xa4:
++            s->w4_display_depth_info = val;
++            break;
++        case 0xa8:
++            s->w4_framebuffer_base = val;
++            break;
++        case 0xac:
++            s->w4_display_resolution_info = val;
++            break;
++        case 0xb0:
++            s->w4_qlen = val;
++            break;
+     }
+ }
+ 
+@@ -163,45 +228,114 @@ static void draw_line32_32(void *opaque, uint8_t *d, const uint8_t *s, int width
+         //printf("R: %d, G: %d, B: %d\n", r, g, b);
+         ((uint32_t *) d)[0] = rgb_to_pixel32(r, g, b);
+         s += 4;
+-        d += 4;
++        d += deststep;
+     } while (-- width != 0);
+ }
+ 
++typedef struct S5L8900LCDWindow {
++    uint32_t enable;
++    uint32_t stride;
++    uint32_t depth;
++    uint32_t base;
++    uint32_t resolution;
++} S5L8900LCDWindow;
++
++static bool s5l8900_lcd_scanout(IPodTouchLCDState *lcd, hwaddr *base,
++                              int *width, int *height, int *stride)
++{
++    const S5L8900LCDWindow windows[] = {
++        { 0x40, lcd->w1_hspan, lcd->w1_display_depth_info,
++          lcd->w1_framebuffer_base, lcd->w1_display_resolution_info },
++        { 0x20, lcd->w2_hspan, lcd->w2_display_depth_info,
++          lcd->w2_framebuffer_base, lcd->w2_display_resolution_info },
++        { 0x10, lcd->w3_hspan, lcd->w3_display_depth_info,
++          lcd->w3_framebuffer_base, lcd->w3_display_resolution_info },
++        { 0x08, lcd->w4_hspan, lcd->w4_display_depth_info,
++          lcd->w4_framebuffer_base, lcd->w4_display_resolution_info },
++    };
++    const S5L8900LCDWindow *window = NULL;
++    uint64_t span;
++    unsigned i, format;
++
++    /* Match the priority used by 1A543a AppleH1CLCD at c03007c4. */
++    for (i = 0; i < ARRAY_SIZE(windows); i++) {
++        if (lcd->lcd_con2 & windows[i].enable) {
++            window = &windows[i];
++            break;
++        }
++    }
++
++    if (!window) {
++        /* Preserve the upstream N45 scanout before window setup is modeled. */
++        *base = lcd->w1_framebuffer_base;
++        *width = 320;
++        *height = 480;
++        *stride = 1280;
++        return true;
++    }
++
++    format = (window->depth >> 8) & 7;
++    /* The kernel identifies formats 6 and 7 as four-byte ARGB, not RGB24. */
++    if (format != 6 && format != 7) {
++        return false;
++    }
++
++    *base = window->base;
++    *width = (window->resolution >> 16) & 0x7ff;
++    *height = window->resolution & 0x3ff;
++    *stride = window->stride;
++    if (!*width || !*height || *stride < 4 * *width ||
++        *stride > 65536) {
++        return false;
++    }
++    span = (uint64_t)*height * *stride;
++    return span <= 64 * MiB && *base <= UINT32_MAX - span;
++}
++
+ static void lcd_refresh(void *opaque)
+ {
+     //fprintf(stderr, "%s: refreshing LCD screen\n", __func__);
+ 
+     IPodTouchLCDState *lcd = (IPodTouchLCDState *) opaque;
+-    DisplaySurface *surface = qemu_console_surface(lcd->con);
++    DisplaySurface *surface;
+     drawfn draw_line;
+-    int src_width, dest_width;
++    int dest_width;
+     int height, first, last;
+-    int width, linesize;
++    int width, linesize, stride;
++    hwaddr base;
++
++    if (!lcd || !lcd->con ||
++        !s5l8900_lcd_scanout(lcd, &base, &width, &height, &stride)) {
++        return;
++    }
+ 
+-    if (!lcd || !lcd->con || !surface_bits_per_pixel(surface))
++    surface = qemu_console_surface(lcd->con);
++    if (surface_width(surface) != width || surface_height(surface) != height) {
++        qemu_console_resize(lcd->con, width, height);
++        surface = qemu_console_surface(lcd->con);
++    }
++    if (surface_bits_per_pixel(surface) != 32) {
+         return;
++    }
+ 
+     dest_width = 4;
+     draw_line = draw_line32_32;
+ 
+-    /* Resolution */
+     first = last = 0;
+-    width = 320;
+-    height = 480;
+     lcd->invalidate = 1;
+ 
+-    src_width =  4 * width;
+     linesize = surface_stride(surface);
+ 
+     if(lcd->invalidate) {
+-        framebuffer_update_memory_section(&lcd->fbsection, lcd->sysmem, lcd->w1_framebuffer_base, height, 4 * width);
++        framebuffer_update_memory_section(&lcd->fbsection, lcd->sysmem,
++                                          base, height, stride);
+     }
+ 
+     framebuffer_update_display(surface, &lcd->fbsection,
+                                width, height,
+-                               src_width,       /* Length of source line, in bytes.  */
+-                               linesize,        /* Bytes between adjacent horizontal output pixels.  */
+-                               dest_width,      /* Bytes between adjacent vertical output pixels.  */
++                               stride,          /* Bytes between source rows. */
++                               linesize,        /* Bytes between output rows. */
++                               dest_width,      /* Bytes between output pixels. */
+                                lcd->invalidate,
+                                draw_line, NULL,
+                                &first, &last);
+@@ -248,7 +382,8 @@ static void refresh_timer_tick(void *opaque)
+ {
+     IPodTouchLCDState *s = (IPodTouchLCDState *)opaque;
+ 
+-    qemu_irq_raise(s->irq);
++    s->unknown2 |= LCD_INT_FRAME_DONE;
++    s5l8900_lcd_update_irq(s);
+ 
+     timer_mod(s->refresh_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND / LCD_REFRESH_RATE_FREQUENCY);
+ }
+@@ -298,4 +433,4 @@ static void ipod_touch_machine_types(void)
+     type_register_static(&ipod_touch_lcd_info);
+ }
+ 
+-type_init(ipod_touch_machine_types)
+\ No newline at end of file
++type_init(ipod_touch_machine_types)
+diff --git a/hw/arm/ipod_touch_multitouch.c b/hw/arm/ipod_touch_multitouch.c
+index 8a1c94d1bf8fd79a193653f7a6e0b48ec5d66144..5991f633cda4c70d475f671ae03592b81dc5afed 100644
+--- a/hw/arm/ipod_touch_multitouch.c
++++ b/hw/arm/ipod_touch_multitouch.c
+@@ -1,4 +1,279 @@
+ #include "hw/arm/ipod_touch_multitouch.h"
++#include "qemu/bswap.h"
++
++/*
++ * Zephyr 1 packet formats are verified against the original 1A543a kernel's
++ * AppleMultitouchSPI driver and openiBoot's multitouch-z1.c. This models the
++ * controller protocol and downloaded RAM; it does not execute ASIC firmware.
++ * Zephyr 2 continues through the original transfer handler below.
++ */
++static unsigned z1_report_size(uint8_t report)
++{
++    switch (report) {
++    case MT_REPORT_UNKNOWN1:
++    case MT_REPORT_FAMILY_ID:
++    case MT_REPORT_SENSOR_REGION_DESC:
++    case MT_REPORT_SENSOR_REGION_PARAM:
++        return 1;
++    case MT_REPORT_SENSOR_INFO:
++        return 5;
++    case MT_REPORT_SENSOR_DIMENSIONS:
++        return 8;
++    default:
++        return 0;
++    }
++}
++
++static void z1_prepare_report(IPodTouchMultitouchState *s, uint8_t report)
++{
++    uint8_t *data = s->z1_out + 4;
++    unsigned length = z1_report_size(report);
++    uint16_t checksum = report;
++    unsigned i;
++
++    s->z1_out[1] = report;
++    switch (report) {
++    case MT_REPORT_UNKNOWN1:
++        data[0] = s->z1_report70;
++        break;
++    case MT_REPORT_FAMILY_ID:
++        data[0] = MT_FAMILY_ID;
++        break;
++    case MT_REPORT_SENSOR_INFO:
++        data[0] = MT_ENDIANNESS;
++        data[1] = MT_SENSOR_ROWS;
++        data[2] = MT_SENSOR_COLUMNS;
++        stw_be_p(data + 3, MT_BCD_VERSION);
++        break;
++    case MT_REPORT_SENSOR_REGION_DESC:
++        data[0] = MT_SENSOR_REGION_DESC;
++        break;
++    case MT_REPORT_SENSOR_REGION_PARAM:
++        data[0] = MT_SENSOR_REGION_PARAM;
++        break;
++    case MT_REPORT_SENSOR_DIMENSIONS:
++        stl_le_p(data, MT_SENSOR_SURFACE_WIDTH);
++        stl_le_p(data + 4, MT_SENSOR_SURFACE_HEIGHT);
++        break;
++    default:
++        hw_error("Zephyr 1: unsupported report read 0x%02x", report);
++    }
++    for (i = 0; i < length; i++) {
++        checksum += data[i];
++    }
++    stw_be_p(data + length, checksum);
++}
++
++static unsigned z1_frame_length(IPodTouchMultitouchState *s)
++{
++    return s->next_frame ? sizeof(MTFrameHeader) + sizeof(FingerData) + 2 : 0;
++}
++
++static void z1_prepare_frame(IPodTouchMultitouchState *s)
++{
++    unsigned length = z1_frame_length(s);
++    uint16_t checksum = 0;
++    unsigned i;
++
++    if (!length) {
++        /* Empty result: marker and a checksum over an empty payload. */
++        s->z1_length = 3;
++        return;
++    }
++    memcpy(s->z1_out + 1, &s->next_frame->frame_packet.header,
++           sizeof(MTFrameHeader));
++    memcpy(s->z1_out + 1 + sizeof(MTFrameHeader),
++           &s->next_frame->finger_data, sizeof(FingerData));
++    for (i = 1; i < length - 1; i++) {
++        checksum += s->z1_out[i];
++    }
++    stw_be_p(s->z1_out + length - 1, checksum);
++    s->z1_length = length + 1;
++}
++
++static uint32_t zephyr1_transfer(IPodTouchMultitouchState *s, uint8_t value)
++{
++    uint8_t result;
++    unsigned i;
++
++    if (s->z1_main_upload) {
++        if (s->z1_main_length == sizeof(s->z1_main_firmware)) {
++            hw_error("Zephyr 1: main firmware exceeds modeled download buffer");
++        }
++        s->z1_main_firmware[s->z1_main_length++] = value;
++        s->z1_upload_checksum += value;
++        return 0;
++    }
++
++    if (!s->z1_index) {
++        unsigned length = z1_frame_length(s);
++        s->z1_command = value;
++        memset(s->z1_in, 0, sizeof(s->z1_in));
++        memset(s->z1_out, 0, sizeof(s->z1_out));
++        s->z1_out[0] = s->z1_running ? 0xaa : 0xd0;
++
++        switch (value) {
++        case 0xc2: /* Download: C2, addressBE, reserved, data, checksumBE. */
++            s->z1_length = MT_Z1_PACKET_SIZE;
++            s->z1_running = false;
++            s->z1_out[0] = 0;
++            break;
++        case 0xc4: /* Execute: C4 00 00 C4. */
++            s->z1_length = 4;
++            s->z1_out[0] = 0;
++            break;
++        case 0x05: /* Checksum query: 05 00 00 06. */
++            s->z1_length = 4;
++            s->z1_out[0] = 0xd0;
++            s->z1_out[1] = s->z1_upload_valid ? 0 : 1;
++            stw_be_p(s->z1_out + 2, s->z1_upload_checksum);
++            break;
++        case 0xd0: /* Interface query, four bytes, big-endian packet size. */
++            s->z1_length = 4;
++            s->z1_out[1] = MT_INTERFACE_VERSION;
++            stw_be_p(s->z1_out + 2, MT_MAX_PACKET_SIZE);
++            break;
++        case 0x8f: /* Report metadata; report ID arrives in byte 1. */
++            s->z1_length = 8;
++            break;
++        case 0x82: /* Report read, report ID arrives in byte 1. */
++        case 0x92: /* Report write, report ID arrives in byte 1. */
++            s->z1_length = 6;
++            break;
++        case 0x46: /* Interface <= 0x10: compact frame-length response. */
++            s->z1_length = 8;
++            stw_be_p(s->z1_out + 1, length);
++            stw_be_p(s->z1_out + 3,
++                     s->z1_out[1] + s->z1_out[2]);
++            break;
++        case 0x64: /* Interface > 0x10: extended frame-length response. */
++        case 0x65:
++            s->z1_length = 8;
++            stw_be_p(s->z1_out + 4, length);
++            stw_be_p(s->z1_out + 6,
++                     s->z1_out[4] + s->z1_out[5]);
++            break;
++        case 0x47:
++        case 0x68:
++            z1_prepare_frame(s);
++            break;
++        default:
++            hw_error("Zephyr 1: unsupported command 0x%02x", value);
++        }
++    }
++
++    if (s->z1_index >= MT_Z1_PACKET_SIZE) {
++        hw_error("Zephyr 1: packet exceeds modeled transfer buffer");
++    }
++    s->z1_in[s->z1_index] = value;
++    if (s->z1_index == 1) {
++        uint8_t report = value;
++        unsigned length = z1_report_size(report);
++
++        switch (s->z1_command) {
++        case 0x8f:
++            s->z1_out[1] = report;
++            /* The upper nibble is a report error, not a length bit. */
++            s->z1_out[4] = length ? length >> 8 : 0x10;
++            s->z1_out[5] = length;
++            stw_be_p(s->z1_out + 6,
++                     report + s->z1_out[4] + s->z1_out[5]);
++            break;
++        case 0x82:
++            z1_prepare_report(s, report);
++            s->z1_length = length + 6;
++            break;
++        case 0x92:
++            if (report != MT_REPORT_UNKNOWN1) {
++                hw_error("Zephyr 1: unsupported report write 0x%02x", report);
++            }
++            s->z1_out[1] = report;
++            s->z1_length = length + 6;
++            break;
++        }
++    }
++    if (s->z1_command == 0x92 && s->z1_index == s->z1_length - 3) {
++        uint16_t checksum = s->z1_in[1];
++        for (i = 4; i < s->z1_length - 2; i++) {
++            checksum += s->z1_in[i];
++        }
++        stw_be_p(s->z1_out + s->z1_length - 2, checksum);
++    }
++
++    result = s->z1_out[s->z1_index++];
++    if (s->z1_index == s->z1_length) {
++        switch (s->z1_command) {
++        case 0xc2: {
++            uint32_t address = ldl_be_p(s->z1_in + 1);
++            uint16_t checksum = 0;
++            for (i = 0; i < MT_Z1_PACKET_SIZE - 2; i++) {
++                checksum += s->z1_in[i];
++            }
++            s->z1_upload_checksum = checksum;
++            s->z1_upload_valid =
++                checksum == lduw_be_p(s->z1_in + MT_Z1_PACKET_SIZE - 2) &&
++                address >= 0x40000000 &&
++                address - 0x40000000 <= MT_Z1_FIRMWARE_RAM_SIZE - 0x3f8;
++            if (s->z1_upload_valid) {
++                memcpy(s->z1_firmware + address - 0x40000000,
++                       s->z1_in + 6, 0x3f8);
++            }
++            break;
++        }
++        case 0xc4:
++            s->z1_running = s->z1_upload_valid &&
++                s->z1_in[1] == 0 && s->z1_in[2] == 0 &&
++                s->z1_in[3] == 0xc4;
++            break;
++        case 0x92:
++            if (s->z1_in[1] == MT_REPORT_UNKNOWN1 &&
++                lduw_be_p(s->z1_in + s->z1_length - 2) ==
++                lduw_be_p(s->z1_out + s->z1_length - 2)) {
++                s->z1_report70 = s->z1_in[4];
++            }
++            break;
++        case 0x47:
++        case 0x68:
++            free(s->next_frame);
++            s->next_frame = NULL;
++            break;
++        }
++        s->z1_index = 0;
++        s->z1_command = 0;
++    }
++    return result;
++}
++
++/*
++ * The original kernel sends C2 00 00 00 in a separate SPI transaction before
++ * its raw main-firmware stream (1A543a: c03c756c-c03c77bc). This boundary must
++ * come from chip select, not a temporarily empty SPI FIFO.
++ */
++void ipod_touch_multitouch_end_transfer(IPodTouchMultitouchState *s)
++{
++    if (!s->zephyr1) {
++        return;
++    }
++    if (s->z1_main_upload) {
++        if (s->z1_main_length) {
++            s->z1_upload_valid = true;
++            s->z1_main_upload = false;
++        }
++        return;
++    }
++    if (s->z1_command == 0xc2 && s->z1_index == 4 &&
++        s->z1_in[1] == 0 && s->z1_in[2] == 0 && s->z1_in[3] == 0) {
++        s->z1_main_upload = true;
++        s->z1_main_length = 0;
++        s->z1_upload_checksum = 0;
++        s->z1_upload_valid = false;
++        s->z1_index = 0;
++        s->z1_command = 0;
++    } else if (s->z1_index) {
++        hw_error("Zephyr 1: truncated command 0x%02x (%u of %u bytes)",
++                 s->z1_command, s->z1_index, s->z1_length);
++    }
++}
+ 
+ static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
+     memset(s->out_buffer + 1, 0, 15);
+@@ -120,6 +395,10 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
+ {
+     IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
+ 
++    if (s->zephyr1) {
++        return zephyr1_transfer(s, value);
++    }
++
+     //printf("<MULTITOUCH> Got value: 0x%02x\n", value);
+ 
+     if(s->cur_cmd == 0) {
+@@ -341,8 +620,7 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
+ }
+ 
+ static void ipod_touch_multitouch_inform_frame_ready(IPodTouchMultitouchState *s) {
+-    s->sysic->gpio_int_status[4] |= (1 << 27); // the multitouch interrupt bit is in group 4 (32 interrupts per group), and the 27th of the 4th group
+-    qemu_irq_raise(s->sysic->gpio_irqs[4]);
++    ipod_touch_sysic_gpio_event(s->sysic, s->gpio_attention);
+ }
+ 
+ void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s) {
+@@ -394,6 +672,9 @@ static void ipod_touch_multitouch_realize(SSIPeripheral *d, Error **errp)
+     s->prev_touch_x = 0;
+     s->prev_touch_y = 0;
+     s->last_frame_timestamp = 0;
++    s->gpio_attention = 0x9b;
++    s->gpio_home_pin = GPIO_BUTTON_HOME;
++    s->gpio_home_irq = GPIO_BUTTON_HOME_IRQ;
+ }
+ 
+ static void ipod_touch_multitouch_class_init(ObjectClass *klass, void *data)
+diff --git a/hw/arm/ipod_touch_nand.c b/hw/arm/ipod_touch_nand.c
+index 3cf7fa6c2651689ab93961f2c47f080a755f49b4..f5abd026585c9ea97d6ac6f8f1645dd33f8aeea3 100644
+--- a/hw/arm/ipod_touch_nand.c
++++ b/hw/arm/ipod_touch_nand.c
+@@ -1,4 +1,119 @@
+ #include "hw/arm/ipod_touch_nand.h"
++#include "hw/qdev-properties.h"
++
++static void nand_validate_page(uint32_t bank, uint32_t page)
++{
++    if (bank >= NAND_NUM_BANKS || page >= NAND_PAGES_PER_BANK) {
++        hw_error("NAND: invalid bank %u or page %u", bank, page);
++    }
++}
++
++static bool nand_has_overlay(ITNandState *s)
++{
++    return s->nand_overlay && *s->nand_overlay;
++}
++
++static FILE *nand_open_page(const char *path, uint32_t bank, uint32_t page)
++{
++    g_autofree char *filename = g_strdup_printf("%s/bank%u/%u.page",
++                                               path, bank, page);
++    FILE *file = fopen(filename, "rb");
++
++    if (!file && errno != ENOENT) {
++        hw_error("NAND: unable to open %s: %s", filename, g_strerror(errno));
++    }
++    return file;
++}
++
++void nand_read_page(ITNandState *s, uint32_t bank, uint32_t page,
++                    uint8_t *data, uint8_t *spare)
++{
++    FILE *file = NULL;
++    uint8_t contents[NAND_BYTES_PER_PAGE + NAND_BYTES_PER_SPARE];
++
++    nand_validate_page(bank, page);
++    if (nand_has_overlay(s)) {
++        file = nand_open_page(s->nand_overlay, bank, page);
++    }
++    if (!file) {
++        file = nand_open_page(s->nand_path, bank, page);
++    }
++    if (!file) {
++        /* Physical erased M68 NAND is all ones. N45 retains its upstream
++         * sparse-page representation when erased-page-fill is left at zero.
++         */
++        if (data) {
++            memset(data, s->erased_page_fill, NAND_BYTES_PER_PAGE);
++        }
++        if (spare) {
++            memset(spare, s->erased_page_fill, NAND_BYTES_PER_SPARE);
++            spare[0xa] = 0xff;
++        }
++        return;
++    }
++
++    if (fread(contents, 1, sizeof(contents), file) != sizeof(contents) ||
++        fgetc(file) != EOF || ferror(file)) {
++        fclose(file);
++        hw_error("NAND: invalid page length at bank %u, page %u", bank, page);
++    }
++    if (fclose(file)) {
++        hw_error("NAND: unable to close page at bank %u, page %u: %s",
++                 bank, page, g_strerror(errno));
++    }
++    if (data) {
++        memcpy(data, contents, NAND_BYTES_PER_PAGE);
++    }
++    if (spare) {
++        memcpy(spare, contents + NAND_BYTES_PER_PAGE, NAND_BYTES_PER_SPARE);
++    }
++}
++
++static void nand_flush_page(ITNandState *s)
++{
++    g_autofree char *filename = NULL;
++    g_autofree char *temporary = NULL;
++    FILE *file;
++    int fd, error;
++    bool overlay = nand_has_overlay(s);
++
++    nand_validate_page(s->buffered_bank, s->buffered_page);
++    filename = g_strdup_printf("%s/bank%u/%u%s.page",
++                               overlay ? s->nand_overlay : s->nand_path,
++                               s->buffered_bank, s->buffered_page,
++                               overlay ? "" : "_new");
++    temporary = g_strdup_printf("%s.tmp-XXXXXX", filename);
++    fd = g_mkstemp(temporary);
++    if (fd < 0) {
++        hw_error("NAND: unable to create %s: %s", temporary, g_strerror(errno));
++    }
++    file = fdopen(fd, "wb");
++    if (!file) {
++        error = errno;
++        close(fd);
++        unlink(temporary);
++        hw_error("NAND: unable to open temporary page: %s", g_strerror(error));
++    }
++
++    qemu_mutex_lock(&s->lock);
++    if (fwrite(s->page_buffer, 1, NAND_BYTES_PER_PAGE, file) !=
++            NAND_BYTES_PER_PAGE ||
++        fwrite(s->page_spare_buffer, 1, NAND_BYTES_PER_SPARE, file) !=
++            NAND_BYTES_PER_SPARE || fflush(file) || fsync(fd)) {
++        error = errno;
++        fclose(file);
++        unlink(temporary);
++        qemu_mutex_unlock(&s->lock);
++        hw_error("NAND: unable to write complete page: %s", g_strerror(error));
++    }
++    if (fclose(file) || rename(temporary, filename)) {
++        error = errno;
++        unlink(temporary);
++        qemu_mutex_unlock(&s->lock);
++        hw_error("NAND: unable to publish complete page: %s", g_strerror(error));
++    }
++    qemu_mutex_unlock(&s->lock);
++}
+ 
+ static int get_bank(ITNandState *s) {
+     uint32_t bank_bitmap = (s->fmctrl0 >> 1) & 0xFF;
+@@ -27,24 +142,7 @@ void nand_set_buffered_page(ITNandState *s, uint32_t page) {
+     }
+ 
+     if(bank != s->buffered_bank || page != s->buffered_page) {
+-        // refresh the buffered page
+-        uint32_t vpn = page * 8 + bank;
+-        char filename[200];
+-        sprintf(filename, "%s/bank%d/%d.page", s->nand_path, bank, page);
+-        struct stat st = {0};
+-        if (stat(filename, &st) == -1) {
+-            // page storage does not exist - initialize an empty buffer
+-            memset(s->page_buffer, 0, NAND_BYTES_PER_PAGE);
+-            memset(s->page_spare_buffer, 0, NAND_BYTES_PER_SPARE);
+-            s->page_spare_buffer[0xA] = 0xFF; // make sure we add the FTL mark to an empty page
+-        }
+-        else {
+-            FILE *f = fopen(filename, "rb");
+-            if (f == NULL) { hw_error("Unable to read file!"); }
+-            fread(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+-            fread(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+-            fclose(f);
+-        }
++        nand_read_page(s, bank, page, s->page_buffer, s->page_spare_buffer);
+ 
+         s->buffered_page = page;
+         s->buffered_bank = bank;
+@@ -64,6 +162,10 @@ static uint64_t itnand_read(void *opaque, hwaddr addr, unsigned size)
+             return s->fmctrl0;
+         case NAND_FMFIFO:
+             if(s->cmd == NAND_CMD_ID) {
++                int bank = get_bank(s);
++                if (bank < 0 || !(s->bank_mask & (1u << bank))) {
++                    return UINT32_MAX;
++                }
+                 return NAND_CHIP_ID;
+             }
+             else if(s->cmd == NAND_CMD_READSTATUS) {
+@@ -162,20 +264,7 @@ static void itnand_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+                 // we're done!
+                 s->is_writing = false;
+ 
+-                // flush the page buffer to the disk
+-                uint32_t vpn = s->buffered_page * 8 + s->buffered_bank;
+-                //printf("Flushing page %d, bank %d, vpn %d\n", s->buffered_page, s->buffered_bank, vpn);
+-                qemu_mutex_lock(&s->lock);
+-                qemu_mutex_unlock(&s->lock);
+-                {
+-                    char filename[200];
+-                    sprintf(filename, "%s/bank%d/%d_new.page", s->nand_path, s->buffered_bank, s->buffered_page);
+-                    FILE *f = fopen(filename, "wb");
+-                    if (f == NULL) { hw_error("Unable to read file!"); }
+-                    fwrite(s->page_buffer, sizeof(char), NAND_BYTES_PER_PAGE, f);
+-                    fwrite(s->page_spare_buffer, sizeof(char), NAND_BYTES_PER_SPARE, f);
+-                    fclose(f);
+-                }
++                nand_flush_page(s);
+             }
+             break;
+         case NAND_RSCTRL:
+@@ -222,12 +311,24 @@ static void itnand_reset(DeviceState *d)
+     s->cmd = 0;
+     s->reading_spare = 0;
+     s->buffered_page = -1;
++    s->buffered_bank = -1;
++    s->reading_multiple_pages = false;
++    s->is_writing = false;
++    s->cur_bank_reading = -1;
+ }
+ 
++static Property nand_properties[] = {
++    DEFINE_PROP_STRING("nand-overlay", ITNandState, nand_overlay),
++    DEFINE_PROP_UINT8("erased-page-fill", ITNandState, erased_page_fill, 0),
++    DEFINE_PROP_UINT8("bank-mask", ITNandState, bank_mask, 0xff),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void itnand_class_init(ObjectClass *oc, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(oc);
+     dc->reset = itnand_reset;
++    device_class_set_props(dc, nand_properties);
+ }
+ 
+ static const TypeInfo itnand_info = {
+diff --git a/hw/arm/ipod_touch_pcf50633_pmu.c b/hw/arm/ipod_touch_pcf50633_pmu.c
+index cd7701a0dca74dcd56e30bdaab147690b395e825..19ff3e3ce428f63ee6a0113f6a5e529ac9af62c0 100644
+--- a/hw/arm/ipod_touch_pcf50633_pmu.c
++++ b/hw/arm/ipod_touch_pcf50633_pmu.c
+@@ -30,7 +30,13 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
+             res = 0; // battery power source
+             break;
+         case PMU_ADCC1:
+-            res = 0; // battery charge voltage
++            /* M68 iBoot expects completed ADC conversion, then the high
++             * result byte at 0x55. Model 682/1023 * 6000 = 4000 mV.
++             */
++            res = s->battery_adc_ready ? 0x82 : 0;
++            break;
++        case 0x55:
++            res = s->battery_adc_ready ? 0xaa : 0;
+             break;
+         case PMU_RTCSC:  // seconds
+             res = int_to_bcd(tm.tm_sec);
+@@ -101,4 +107,4 @@ static void pcf50633_register_types(void)
+     type_register_static(&pcf50633_info);
+ }
+ 
+-type_init(pcf50633_register_types)
+\ No newline at end of file
++type_init(pcf50633_register_types)
+diff --git a/hw/arm/ipod_touch_sha1.c b/hw/arm/ipod_touch_sha1.c
+index 09e8d6e0dc0bdb23affce2997909489cf7c7b32e..8607b7fd4b7e0df7749bdd96ecd5465c43b73d21 100644
+--- a/hw/arm/ipod_touch_sha1.c
++++ b/hw/arm/ipod_touch_sha1.c
+@@ -1,7 +1,6 @@
+ #include "hw/arm/ipod_touch_sha1.h"
+ 
+-static uint64_t swapLong(void *X) {
+-    uint64_t x = (uint64_t) X;
++static uint64_t swapLong(uint64_t x) {
+     x = (x & 0x00000000FFFFFFFF) << 32 | (x & 0xFFFFFFFF00000000) >> 32;
+     x = (x & 0x0000FFFF0000FFFF) << 16 | (x & 0xFFFF0000FFFF0000) >> 16;
+     x = (x & 0x00FF00FF00FF00FF) << 8  | (x & 0xFF00FF00FF00FF00) >> 8;
+@@ -150,4 +149,4 @@ static void ipod_touch_machine_types(void)
+     type_register_static(&ipod_touch_sha1_info);
+ }
+ 
+-type_init(ipod_touch_machine_types)
+\ No newline at end of file
++type_init(ipod_touch_machine_types)
+diff --git a/hw/arm/ipod_touch_spi.c b/hw/arm/ipod_touch_spi.c
+index 0b763eb2dffe95d236ae9ae050fa96a3f98537de..89545f1d9e16fe157ffd71c352df9b3ed74d999c 100644
+--- a/hw/arm/ipod_touch_spi.c
++++ b/hw/arm/ipod_touch_spi.c
+@@ -74,12 +74,16 @@ static void apple_spi_update_cs(S5L8900SPIState *s)
+ static void apple_spi_cs_set(void *opaque, int pin, int level)
+ {
+     S5L8900SPIState *s = S5L8900SPI(opaque);
++    bool was_high = (REG(s, R_PIN) & R_PIN_CS) != 0;
+     if (level) {
+         REG(s, R_PIN) |= R_PIN_CS;
+     } else {
+         REG(s, R_PIN) &= ~R_PIN_CS;
+     }
+     apple_spi_update_cs(s);
++    if (level && !was_high && s->base == 2 && s->mt && s->mt->zephyr1) {
++        ipod_touch_multitouch_end_transfer(s->mt);
++    }
+ }
+ 
+ static void apple_spi_run(S5L8900SPIState *s)
+@@ -309,4 +313,4 @@ static void s5l8900_spi_register_types(void)
+     type_register_static(&s5l8900_spi_info);
+ }
+ 
+-type_init(s5l8900_spi_register_types)
+\ No newline at end of file
++type_init(s5l8900_spi_register_types)
+diff --git a/hw/arm/ipod_touch_sysic.c b/hw/arm/ipod_touch_sysic.c
+index 34ec9ab7a82d10e9f9cf651acf6a145b82ff0958..f727b3a9f3f0335ba3df5f1bec34a028ea491996 100644
+--- a/hw/arm/ipod_touch_sysic.c
++++ b/hw/arm/ipod_touch_sysic.c
+@@ -1,4 +1,53 @@
+ #include "hw/arm/ipod_touch_sysic.h"
++#include "hw/hw.h"
++
++static void ipod_touch_sysic_update_gpio(IPodTouchSYSICState *s, unsigned group)
++{
++    uint32_t level_bits = s->gpio_int_type[group];
++    uint32_t active = ~(s->gpio_input_level[group] ^ s->gpio_int_level[group]) &
++                      s->gpio_input_known[group] & level_bits;
++    s->gpio_int_status[group] = (s->gpio_int_status[group] & ~level_bits) | active;
++    qemu_set_irq(s->gpio_irqs[group],
++                 (s->gpio_int_status[group] & s->gpio_int_enabled[group]) != 0);
++}
++
++void ipod_touch_sysic_gpio_input(IPodTouchSYSICState *s, unsigned interrupt,
++                                bool high)
++{
++    unsigned group = interrupt / 32;
++    uint32_t bit = 1U << (interrupt % 32);
++    bool known, old_high;
++
++    if (group >= GPIO_NUMINTGROUPS) {
++        hw_error("SYSIC: invalid GPIO input %u", interrupt);
++    }
++    known = (s->gpio_input_known[group] & bit) != 0;
++    old_high = (s->gpio_input_level[group] & bit) != 0;
++    s->gpio_input_known[group] |= bit;
++    s->gpio_input_level[group] = (s->gpio_input_level[group] & ~bit) |
++                                 (high ? bit : 0);
++    if (known && old_high != high && !(s->gpio_int_type[group] & bit) &&
++        high == ((s->gpio_int_level[group] & bit) != 0)) {
++        s->gpio_int_status[group] |= bit;
++    }
++    ipod_touch_sysic_update_gpio(s, group);
++}
++
++void ipod_touch_sysic_gpio_event(IPodTouchSYSICState *s, unsigned interrupt)
++{
++    unsigned group = interrupt / 32;
++    uint32_t bit = 1U << (interrupt % 32);
++
++    if (group >= GPIO_NUMINTGROUPS) {
++        hw_error("SYSIC: invalid GPIO event %u", interrupt);
++    }
++    s->gpio_int_status[group] |= bit;
++    if (s->iphone_2g) {
++        ipod_touch_sysic_update_gpio(s, group);
++    } else {
++        qemu_irq_raise(s->gpio_irqs[group]);
++    }
++}
+ 
+ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
+ {
+@@ -16,22 +65,22 @@ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
+         case 0x7a:
+         case 0x7c:
+             return 1;
+-        case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTLEVEL ... (GPIO_INTLEVEL + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTLEVEL) / 4;
+             return s->gpio_int_level[group];
+         }
+-        case GPIO_INTSTAT ... (GPIO_INTSTAT + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTSTAT ... (GPIO_INTSTAT + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTSTAT) / 4;
+             return s->gpio_int_status[group];
+         }
+-        case GPIO_INTEN ... (GPIO_INTEN + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTEN ... (GPIO_INTEN + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTEN) / 4;
+             return s->gpio_int_enabled[group];
+         }
+-        case GPIO_INTTYPE ... (GPIO_INTTYPE + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTTYPE ... (GPIO_INTTYPE + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTTYPE) / 4;
+             return s->gpio_int_type[group];
+@@ -56,31 +105,46 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
+         case POWER_OFFCTRL:
+             s->power_state = val;
+             break;
+-        case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTLEVEL ... (GPIO_INTLEVEL + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
++            if (s->iphone_2g) {
++                unsigned group = (addr - GPIO_INTLEVEL) / 4;
++                s->gpio_int_level[group] = val;
++                ipod_touch_sysic_update_gpio(s, group);
++            }
+             break;
+         }
+-        case GPIO_INTSTAT ... (GPIO_INTSTAT + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTSTAT ... (GPIO_INTSTAT + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTSTAT) / 4;
+ 
+             // acknowledge the interrupts and clear the corresponding bits
+             s->gpio_int_status[group] = s->gpio_int_status[group] & ~val;
+ 
+-            qemu_irq_lower(s->gpio_irqs[group]);
++            if (s->iphone_2g) {
++                ipod_touch_sysic_update_gpio(s, group);
++            } else {
++                qemu_irq_lower(s->gpio_irqs[group]);
++            }
+ 
+             break;
+         }
+-        case GPIO_INTEN ... (GPIO_INTEN + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTEN ... (GPIO_INTEN + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTEN) / 4;
+             s->gpio_int_enabled[group] = val;
++            if (s->iphone_2g) {
++                ipod_touch_sysic_update_gpio(s, group);
++            }
+             break;
+         }
+-        case GPIO_INTTYPE ... (GPIO_INTTYPE + GPIO_NUMINTGROUPS * 4):
++        case GPIO_INTTYPE ... (GPIO_INTTYPE + (GPIO_NUMINTGROUPS - 1) * 4):
+         {
+             uint8_t group = (addr - GPIO_INTTYPE) / 4;
+             s->gpio_int_type[group] = val;
++            if (s->iphone_2g) {
++                ipod_touch_sysic_update_gpio(s, group);
++            }
+             break;
+         }
+         default:
+@@ -106,9 +170,28 @@ static void ipod_touch_sysic_init(Object *obj)
+     }
+ }
+ 
++static void ipod_touch_sysic_reset(DeviceState *dev)
++{
++    IPodTouchSYSICState *s = IPOD_TOUCH_SYSIC(dev);
++    unsigned group;
++
++    if (!s->iphone_2g) {
++        return;
++    }
++    s->power_state = 0;
++    memset(s->gpio_int_level, 0, sizeof(s->gpio_int_level));
++    memset(s->gpio_int_status, 0, sizeof(s->gpio_int_status));
++    memset(s->gpio_int_enabled, 0, sizeof(s->gpio_int_enabled));
++    memset(s->gpio_int_type, 0, sizeof(s->gpio_int_type));
++    for (group = 0; group < GPIO_NUMINTGROUPS; group++) {
++        ipod_touch_sysic_update_gpio(s, group);
++    }
++}
++
+ static void ipod_touch_sysic_class_init(ObjectClass *klass, void *data)
+ {
+-    
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->reset = ipod_touch_sysic_reset;
+ }
+ 
+ static const TypeInfo ipod_touch_sysic_type_info = {
+diff --git a/hw/arm/ipod_touch_timer.c b/hw/arm/ipod_touch_timer.c
+index 4842f56679943992f94b0a7ade9262db47d151d3..070a9da8f6381ed84289727f3f7d65452b872c51 100644
+--- a/hw/arm/ipod_touch_timer.c
++++ b/hw/arm/ipod_touch_timer.c
+@@ -1,4 +1,114 @@
+ #include "hw/arm/ipod_touch_timer.h"
++#include "qemu/log.h"
++
++/*
++ * Timer4's divider encoding is documented by openiBoot's S5L8900 driver.
++ * This model uses the board's fixed SYSCLK as the input. Other clock sources
++ * and the prescaler's arithmetic are not yet established for the M68 guest.
++ */
++static uint32_t s5l8900_legacy_timer_hz(IPodTouchTimerState *s)
++{
++    static const uint8_t divisors[] = { 2, 4, 16, 64, 1 };
++    unsigned selector = (s->config >> 8) & 7;
++
++    if (!s->sysclk || selector >= ARRAY_SIZE(divisors)) {
++        return 0;
++    }
++    return clock_get_hz(s->sysclk) / divisors[selector];
++}
++
++static uint64_t s5l8900_legacy_duration_ns(uint32_t count, uint32_t hz)
++{
++    uint64_t numerator = (uint64_t)count * NANOSECONDS_PER_SECOND;
++
++    /* Round up: the interrupt must never precede the count reaching zero. */
++    return numerator / hz + !!(numerator % hz);
++}
++
++static uint32_t s5l8900_legacy_current_count(IPodTouchTimerState *s,
++                                          uint64_t now)
++{
++    uint64_t elapsed;
++
++    if (!s->legacy_running || !s->legacy_freq_hz ||
++        now <= s->legacy_epoch_ns) {
++        return s->legacy_count;
++    }
++    elapsed = now - s->legacy_epoch_ns;
++    if (elapsed >= s5l8900_legacy_duration_ns(s->legacy_count,
++                                           s->legacy_freq_hz)) {
++        return 0;
++    }
++    return s->legacy_count - muldiv64(elapsed, s->legacy_freq_hz,
++                                     NANOSECONDS_PER_SECOND);
++}
++
++static void s5l8900_legacy_schedule(IPodTouchTimerState *s)
++{
++    uint64_t delay;
++
++    timer_del(s->st_timer);
++    s->next_planned_tick = 0;
++    if (!s->legacy_running || !s->legacy_freq_hz) {
++        return;
++    }
++    delay = s5l8900_legacy_duration_ns(s->legacy_count, s->legacy_freq_hz);
++    /* A zero-count write expires on the next finite virtual-time quantum. */
++    delay = delay ? delay : 1;
++    if (delay > INT64_MAX - s->legacy_epoch_ns) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "S5L8900 M68 timer4: deadline exceeds virtual clock\n");
++        return;
++    }
++    s->next_planned_tick = s->legacy_epoch_ns + delay;
++    timer_mod(s->st_timer, s->next_planned_tick);
++}
++
++static bool s5l8900_legacy_write(IPodTouchTimerState *s, hwaddr addr,
++                               uint32_t value)
++{
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    switch (addr) {
++    case TIMER_4 + TIMER_CONFIG:
++        s->legacy_count = s5l8900_legacy_current_count(s, now);
++        s->legacy_epoch_ns = now;
++        s->config = value;
++        s->legacy_freq_hz = s5l8900_legacy_timer_hz(s);
++        if (((value >> 8) & 7) >= 5) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "S5L8900 M68 timer4: unsupported divider %u; "
++                          "countdown frozen\n", (value >> 8) & 7);
++        }
++        s5l8900_legacy_schedule(s);
++        return true;
++    case TIMER_4 + TIMER_STATE:
++        s->legacy_count = s5l8900_legacy_current_count(s, now);
++        if ((value & TIMER_STATE_MANUALUPDATE) ||
++            ((value & TIMER_STATE_START) && !s->legacy_loaded)) {
++            s->legacy_count = s->bcreload;
++            s->legacy_loaded = true;
++        }
++        s->legacy_epoch_ns = now;
++        s->legacy_freq_hz = s5l8900_legacy_timer_hz(s);
++        s->legacy_running = !!(value & TIMER_STATE_START);
++        s->status = value;
++        s5l8900_legacy_schedule(s);
++        return true;
++    case TIMER_4 + TIMER_COUNT_BUFFER:
++        s->bcount1 = s->bcreload = value;
++        return true;
++    case TIMER_4 + TIMER_COUNT_BUFFER2:
++        s->bcount2 = value;
++        return true;
++    case TIMER_4 + TIMER_PRESCALER:
++        /* Preserve readback without guessing undocumented prescaler behavior. */
++        s->prescaler = value;
++        return true;
++    default:
++        return false;
++    }
++}
+ 
+ static void s5l8900_st_update(IPodTouchTimerState *s)
+ {
+@@ -21,6 +131,24 @@ static void s5l8900_st_tick(void *opaque)
+ {
+     IPodTouchTimerState *s = (IPodTouchTimerState *)opaque;
+ 
++    if (s->s5l8900_legacy) {
++        s->next_planned_tick = 0;
++        if (!s->legacy_running || !(s->status & TIMER_STATE_START)) {
++            return;
++        }
++        s->legacy_count = 0;
++        s->legacy_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        /* Retain the established interrupt/ack path; no guessed status bits. */
++        qemu_irq_raise(s->irq);
++        if (s->status & TIMER_STATE_MANUALUPDATE) {
++            s->legacy_running = false;
++        } else {
++            s->legacy_count = s->bcreload;
++            s5l8900_legacy_schedule(s);
++        }
++        return;
++    }
++
+     if (s->status & TIMER_STATE_START) {
+         //fprintf(stderr, "%s: Raising irq\n", __func__);
+         qemu_irq_raise(s->irq);
+@@ -41,6 +169,10 @@ static void s5l8900_timer1_write(void *opaque, hwaddr addr, uint64_t value, unsi
+     //fprintf(stderr, "%s: writing 0x%08x to 0x%08x\n", __func__, value, addr);
+     IPodTouchTimerState *s = (struct IPodTouchTimerState *) opaque;
+ 
++    if (s->s5l8900_legacy && s5l8900_legacy_write(s, addr, value)) {
++        return;
++    }
++
+     switch(addr){
+ 
+         case TIMER_IRQSTAT:
+@@ -81,6 +213,32 @@ static uint64_t s5l8900_timer1_read(void *opaque, hwaddr addr, unsigned size)
+     IPodTouchTimerState *s = (struct IPodTouchTimerState *) opaque;
+     uint64_t elapsed_ns, ticks;
+ 
++    if (s->s5l8900_legacy) {
++        switch (addr) {
++        case TIMER_TICKSHIGH:
++        case TIMER_TICKSLOW:
++            /* Independent absolute-time counter at the established SYSCLK/2. */
++            elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 2;
++            ticks = clock_ns_to_ticks(s->sysclk, elapsed_ns);
++            return addr == TIMER_TICKSHIGH ? ticks >> 32 : (uint32_t)ticks;
++        case TIMER_4 + TIMER_CONFIG:
++            return s->config;
++        case TIMER_4 + TIMER_STATE:
++            return s->status;
++        case TIMER_4 + TIMER_COUNT_BUFFER:
++            return s->bcreload;
++        case TIMER_4 + TIMER_COUNT_BUFFER2:
++            return s->bcount2;
++        case TIMER_4 + TIMER_PRESCALER:
++            return s->prescaler;
++        case TIMER_4 + TIMER_CURRENT_COUNT:
++            return s5l8900_legacy_current_count(s,
++                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        default:
++            break;
++        }
++    }
++
+     switch (addr) {
+         case TIMER_TICKSHIGH:    // needs to be fixed so that read from low first works as well
+ 
+@@ -140,4 +298,4 @@ static void ipod_touch_machine_types(void)
+     type_register_static(&ipod_touch_timer_info);
+ }
+ 
+-type_init(ipod_touch_machine_types)
+\ No newline at end of file
++type_init(ipod_touch_machine_types)
+diff --git a/hw/char/exynos4210_uart.c b/hw/char/exynos4210_uart.c
+index 80d401a3795c6e002c62969aaeb7922969a10635..0f222130381cc521b2d0a147a7302fad282b28b2 100644
+--- a/hw/char/exynos4210_uart.c
++++ b/hw/char/exynos4210_uart.c
+@@ -127,6 +127,25 @@ static const Exynos4210UartReg exynos4210_uart_regs[] = {
+ #define UTRSTAT_Tx_BUFFER_EMPTY         0x2
+ #define UTRSTAT_Rx_BUFFER_DATA_READY    0x1
+ 
++/*
++ * S5L8900 predates the Exynos UINTP/UINTSP/UINTM register interface.  The
++ * original 1A543a serial driver enables interrupt sources in UCON and
++ * acknowledges latched events by writing one to UTRSTAT (c04354a0,
++ * c0435684 in the unmodified system kernel).  Its baud timing registers
++ * at 0x34/0x38 must not be treated as Exynos interrupt registers.
++ */
++#define S5L8900_UTRSTAT_RX_IRQ          0x008
++#define S5L8900_UTRSTAT_RX_TIMEOUT      0x010
++#define S5L8900_UTRSTAT_TX_IRQ          0x020
++#define S5L8900_UTRSTAT_MODEM_IRQ       0x040
++#define S5L8900_UTRSTAT_BAUD_IRQ        0x100
++#define S5L8900_UTRSTAT_IRQ_MASK        0x178
++#define S5L8900_UCON_RX_IRQ_ENABLE      0x00800
++#define S5L8900_UCON_RX_TIMEOUT_ENABLE  0x01000
++#define S5L8900_UCON_TX_IRQ_ENABLE      0x02000
++#define S5L8900_UCON_MODEM_IRQ_ENABLE   0x04000
++#define S5L8900_UCON_BAUD_IRQ_ENABLE    0x10000
++
+ /* UART Error Status */
+ #define UERSTAT_OVERRUN  0x1
+ #define UERSTAT_PARITY   0x2
+@@ -159,6 +178,8 @@ struct Exynos4210UartState {
+     qemu_irq          dmairq;
+ 
+     uint32_t channel;
++    bool cts_input;
++    bool s5l8900_legacy;
+ 
+ };
+ 
+@@ -217,6 +238,28 @@ static void fifo_reset(Exynos4210UartFIFO *q)
+     q->rp = 0;
+ }
+ 
++static uint32_t exynos4210_uart_rx_count(const Exynos4210UartState *s)
++{
++    if (s->s5l8900_legacy) {
++        /* Keep the count in migrated register state. The legacy read handler
++         * translates it to count/full bits; sp == rp can mean a full ring.
++         */
++        return s->reg[I_(UFSTAT)];
++    }
++    return fifo_elements_number(&s->rx);
++}
++
++static int exynos4210_uart_rx_space(const Exynos4210UartState *s)
++{
++    if (s->s5l8900_legacy) {
++        uint32_t capacity = MIN(16U, s->rx.size);
++        uint32_t count = exynos4210_uart_rx_count(s);
++
++        return count < capacity ? capacity - count : 0;
++    }
++    return fifo_empty_elements_number(&s->rx);
++}
++
+ static uint32_t exynos4210_uart_FIFO_trigger_level(uint32_t channel,
+                                                    uint32_t reg)
+ {
+@@ -271,7 +314,7 @@ exynos4210_uart_Rx_FIFO_trigger_level(const Exynos4210UartState *s)
+ static void exynos4210_uart_update_dmabusy(Exynos4210UartState *s)
+ {
+     bool rx_dma_enabled = (s->reg[I_(UCON)] & 0x03) == 0x02;
+-    uint32_t count = fifo_elements_number(&s->rx);
++    uint32_t count = exynos4210_uart_rx_count(s);
+ 
+     if (rx_dma_enabled && !count) {
+         qemu_irq_raise(s->dmairq);
+@@ -284,6 +327,36 @@ static void exynos4210_uart_update_dmabusy(Exynos4210UartState *s)
+ 
+ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
+ {
++    if (s->s5l8900_legacy) {
++        uint32_t ucon = s->reg[I_(UCON)];
++        uint32_t enabled = 0;
++        uint32_t pending;
++
++        if (ucon & S5L8900_UCON_RX_IRQ_ENABLE) {
++            enabled |= S5L8900_UTRSTAT_RX_IRQ;
++        }
++        if (ucon & S5L8900_UCON_RX_TIMEOUT_ENABLE) {
++            enabled |= S5L8900_UTRSTAT_RX_TIMEOUT;
++        }
++        if (ucon & S5L8900_UCON_TX_IRQ_ENABLE) {
++            enabled |= S5L8900_UTRSTAT_TX_IRQ;
++        }
++        if (ucon & S5L8900_UCON_MODEM_IRQ_ENABLE) {
++            enabled |= S5L8900_UTRSTAT_MODEM_IRQ;
++        }
++        if (ucon & S5L8900_UCON_BAUD_IRQ_ENABLE) {
++            enabled |= S5L8900_UTRSTAT_BAUD_IRQ;
++        }
++        pending = s->reg[I_(UTRSTAT)] & enabled;
++        qemu_set_irq(s->irq, pending != 0);
++        if (pending) {
++            trace_exynos_uart_irq_raised(s->channel, pending);
++        } else {
++            trace_exynos_uart_irq_lowered(s->channel);
++        }
++        return;
++    }
++
+     /*
+      * The Tx interrupt is always requested if the number of data in the
+      * transmit FIFO is smaller than the trigger level.
+@@ -330,6 +403,14 @@ static void exynos4210_uart_timeout_int(void *opaque)
+     trace_exynos_uart_rx_timeout(s->channel, s->reg[I_(UTRSTAT)],
+                                  s->reg[I_(UINTSP)]);
+ 
++    if (s->s5l8900_legacy) {
++        if (s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY) {
++            s->reg[I_(UTRSTAT)] |= S5L8900_UTRSTAT_RX_TIMEOUT;
++            exynos4210_uart_update_irq(s);
++        }
++        return;
++    }
++
+     if ((s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY) ||
+         (s->reg[I_(UCON)] & (1 << 11))) {
+         s->reg[I_(UINTSP)] |= UINTSP_RXD;
+@@ -388,7 +469,9 @@ static void exynos4210_uart_update_parameters(Exynos4210UartState *s)
+ static void exynos4210_uart_rx_timeout_set(Exynos4210UartState *s)
+ {
+     if (s->reg[I_(UCON)] & 0x80) {
+-        uint32_t timeout = ((s->reg[I_(UCON)] >> 12) & 0x0f) * s->wordtime;
++        /* Legacy UCON[16:11] selects IRQ sources, not an Exynos timeout. */
++        uint32_t timeout = s->s5l8900_legacy ? 3 * s->wordtime :
++            ((s->reg[I_(UCON)] >> 12) & 0x0f) * s->wordtime;
+ 
+         timer_mod(s->fifo_timeout_timer,
+                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + timeout);
+@@ -425,31 +508,61 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
+             s->reg[I_(UFCON)] &= ~UFCON_Tx_FIFO_RESET;
+             trace_exynos_uart_tx_fifo_reset(s->channel);
+         }
++        if (s->s5l8900_legacy) {
++            if (val & UFCON_Rx_FIFO_RESET) {
++                s->reg[I_(UFSTAT)] = 0;
++                s->reg[I_(UTRSTAT)] &= ~(UTRSTAT_Rx_BUFFER_DATA_READY |
++                    S5L8900_UTRSTAT_RX_IRQ | S5L8900_UTRSTAT_RX_TIMEOUT);
++                timer_del(s->fifo_timeout_timer);
++            }
++            if (val & UFCON_Tx_FIFO_RESET) {
++                s->reg[I_(UTRSTAT)] &= ~S5L8900_UTRSTAT_TX_IRQ;
++            }
++            exynos4210_uart_update_irq(s);
++        }
+         break;
+ 
+     case UTXH:
+-        if (qemu_chr_fe_backend_connected(&s->chr)) {
++        if (qemu_chr_fe_backend_connected(&s->chr) || s->s5l8900_legacy) {
+             s->reg[I_(UTRSTAT)] &= ~(UTRSTAT_TRANSMITTER_EMPTY |
+                     UTRSTAT_Tx_BUFFER_EMPTY);
+             ch = (uint8_t)val;
+             /* XXX this blocks entire thread. Rewrite to use
+              * qemu_chr_fe_write and background I/O callbacks */
+-            qemu_chr_fe_write_all(&s->chr, &ch, 1);
++            if (qemu_chr_fe_backend_connected(&s->chr)) {
++                qemu_chr_fe_write_all(&s->chr, &ch, 1);
++            }
+             trace_exynos_uart_tx(s->channel, ch);
+             s->reg[I_(UTRSTAT)] |= UTRSTAT_TRANSMITTER_EMPTY |
+                     UTRSTAT_Tx_BUFFER_EMPTY;
+-            s->reg[I_(UINTSP)]  |= UINTSP_TXD;
++            if (s->s5l8900_legacy) {
++                s->reg[I_(UTRSTAT)] |= S5L8900_UTRSTAT_TX_IRQ;
++            } else {
++                s->reg[I_(UINTSP)] |= UINTSP_TXD;
++            }
+             exynos4210_uart_update_irq(s);
+         }
+         break;
+ 
+     case UINTP:
++        if (s->s5l8900_legacy) {
++            s->reg[I_(offset)] = val;
++            break;
++        }
+         s->reg[I_(UINTP)] &= ~val;
+         s->reg[I_(UINTSP)] &= ~val;
+         trace_exynos_uart_intclr(s->channel, s->reg[I_(UINTP)]);
+         exynos4210_uart_update_irq(s);
+         break;
+     case UTRSTAT:
++        if (s->s5l8900_legacy) {
++            s->reg[I_(UTRSTAT)] &= ~(val & S5L8900_UTRSTAT_IRQ_MASK);
++            trace_exynos_uart_intclr(s->channel,
++                                    s->reg[I_(UTRSTAT)] &
++                                    S5L8900_UTRSTAT_IRQ_MASK);
++            exynos4210_uart_update_irq(s);
++            break;
++        }
+         if (val & UTRSTAT_Rx_TIMEOUT) {
+             s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_TIMEOUT;
+         }
+@@ -462,13 +575,33 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
+                     s->channel, exynos4210_uart_regname(offset), offset);
+         break;
+     case UINTSP:
++        if (s->s5l8900_legacy) {
++            s->reg[I_(offset)] = val;
++            break;
++        }
+         s->reg[I_(UINTSP)]  &= ~val;
+         break;
+     case UINTM:
++        if (s->s5l8900_legacy) {
++            s->reg[I_(offset)] = val;
++            break;
++        }
+         s->reg[I_(UINTM)] = val;
+         exynos4210_uart_update_irq(s);
+         break;
+     case UCON:
++        if (s->s5l8900_legacy) {
++            /* Prime a newly enabled transmitter once; W1C must deassert it. */
++            if ((val & S5L8900_UCON_TX_IRQ_ENABLE) &&
++                !(s->reg[I_(UCON)] & S5L8900_UCON_TX_IRQ_ENABLE) &&
++                (s->reg[I_(UTRSTAT)] & UTRSTAT_Tx_BUFFER_EMPTY)) {
++                s->reg[I_(UTRSTAT)] |= S5L8900_UTRSTAT_TX_IRQ;
++            }
++            s->reg[I_(UCON)] = val;
++            exynos4210_uart_update_irq(s);
++            break;
++        }
++        /* fall through */
+     case UMCON:
+     default:
+         s->reg[I_(offset)] = val;
+@@ -483,6 +616,11 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+     uint32_t res;
+ 
+     switch (offset) {
++    case UMSTAT:
++        res = (s->reg[I_(UMSTAT)] & ~1U) | (s->cts_input ? 1U : 0U);
++        trace_exynos_uart_read(s->channel, offset,
++                              exynos4210_uart_regname(offset), res);
++        return res;
+     case UERSTAT: /* Read Only */
+         res = s->reg[I_(UERSTAT)];
+         s->reg[I_(UERSTAT)] = 0;
+@@ -490,6 +628,14 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+                                exynos4210_uart_regname(offset), res);
+         return res;
+     case UFSTAT: /* Read Only */
++        if (s->s5l8900_legacy) {
++            uint32_t count = exynos4210_uart_rx_count(s);
++            /* The synchronous transmitter is empty. S5L RX count is 4 bits. */
++            res = count >= 16 ? UFSTAT_Rx_FIFO_FULL : count;
++            trace_exynos_uart_read(s->channel, offset,
++                                  exynos4210_uart_regname(offset), res);
++            return res;
++        }
+         s->reg[I_(UFSTAT)] = fifo_elements_number(&s->rx) & 0xff;
+         if (fifo_empty_elements_number(&s->rx) == 0) {
+             s->reg[I_(UFSTAT)] |= UFSTAT_Rx_FIFO_FULL;
+@@ -501,17 +647,22 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+         return s->reg[I_(UFSTAT)];
+     case URXH:
+         if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
+-            if (fifo_elements_number(&s->rx)) {
++            if (exynos4210_uart_rx_count(s)) {
+                 res = fifo_retrieve(&s->rx);
++                if (s->s5l8900_legacy) {
++                    s->reg[I_(UFSTAT)]--;
++                }
+                 trace_exynos_uart_rx(s->channel, res);
+-                if (!fifo_elements_number(&s->rx)) {
++                if (!exynos4210_uart_rx_count(s)) {
+                     s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_BUFFER_DATA_READY;
+                 } else {
+                     s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY;
+                 }
+             } else {
+                 trace_exynos_uart_rx_error(s->channel);
+-                s->reg[I_(UINTSP)] |= UINTSP_ERROR;
++                if (!s->s5l8900_legacy) {
++                    s->reg[I_(UINTSP)] |= UINTSP_ERROR;
++                }
+                 exynos4210_uart_update_irq(s);
+                 res = 0;
+             }
+@@ -519,6 +670,10 @@ static uint64_t exynos4210_uart_read(void *opaque, hwaddr offset,
+             s->reg[I_(UTRSTAT)] &= ~UTRSTAT_Rx_BUFFER_DATA_READY;
+             res = s->reg[I_(URXH)];
+         }
++        if (s->s5l8900_legacy &&
++            !(s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY)) {
++            timer_del(s->fifo_timeout_timer);
++        }
+         qemu_chr_fe_accept_input(&s->chr);
+         exynos4210_uart_update_dmabusy(s);
+         trace_exynos_uart_read(s->channel, offset,
+@@ -555,7 +710,7 @@ static int exynos4210_uart_can_receive(void *opaque)
+     Exynos4210UartState *s = (Exynos4210UartState *)opaque;
+ 
+     if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
+-        return fifo_empty_elements_number(&s->rx);
++        return exynos4210_uart_rx_space(s);
+     } else {
+         return !(s->reg[I_(UTRSTAT)] & UTRSTAT_Rx_BUFFER_DATA_READY);
+     }
+@@ -566,19 +721,35 @@ static void exynos4210_uart_receive(void *opaque, const uint8_t *buf, int size)
+     Exynos4210UartState *s = (Exynos4210UartState *)opaque;
+     int i;
+ 
++    if (s->s5l8900_legacy && size <= 0) {
++        return;
++    }
+     if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
+-        if (fifo_empty_elements_number(&s->rx) < size) {
+-            size = fifo_empty_elements_number(&s->rx);
+-            s->reg[I_(UINTSP)] |= UINTSP_ERROR;
++        if (exynos4210_uart_rx_space(s) < size) {
++            size = exynos4210_uart_rx_space(s);
++            if (s->s5l8900_legacy) {
++                s->reg[I_(UERSTAT)] |= UERSTAT_OVERRUN;
++            } else {
++                s->reg[I_(UINTSP)] |= UINTSP_ERROR;
++            }
+         }
+         for (i = 0; i < size; i++) {
+             fifo_store(&s->rx, buf[i]);
+         }
++        if (s->s5l8900_legacy) {
++            s->reg[I_(UFSTAT)] += size;
++            if (!exynos4210_uart_rx_count(s)) {
++                return;
++            }
++        }
+         exynos4210_uart_rx_timeout_set(s);
+     } else {
+         s->reg[I_(URXH)] = buf[0];
+     }
+     s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY;
++    if (s->s5l8900_legacy) {
++        s->reg[I_(UTRSTAT)] |= S5L8900_UTRSTAT_RX_IRQ;
++    }
+ 
+     exynos4210_uart_update_irq(s);
+ }
+@@ -591,8 +762,29 @@ static void exynos4210_uart_event(void *opaque, QEMUChrEvent event)
+     if (event == CHR_EVENT_BREAK) {
+         /* When the RxDn is held in logic 0, then a null byte is pushed into the
+          * fifo */
+-        fifo_store(&s->rx, '\0');
++        if (s->s5l8900_legacy) {
++            if (s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) {
++                if (exynos4210_uart_rx_space(s)) {
++                    fifo_store(&s->rx, '\0');
++                    s->reg[I_(UFSTAT)]++;
++                } else {
++                    s->reg[I_(UERSTAT)] |= UERSTAT_OVERRUN;
++                }
++            } else {
++                s->reg[I_(URXH)] = 0;
++            }
++        } else {
++            fifo_store(&s->rx, '\0');
++        }
+         s->reg[I_(UERSTAT)] |= UERSTAT_BREAK;
++        if (s->s5l8900_legacy) {
++            if ((s->reg[I_(UFCON)] & UFCON_FIFO_ENABLE) &&
++                !exynos4210_uart_rx_count(s)) {
++                return;
++            }
++            s->reg[I_(UTRSTAT)] |= UTRSTAT_Rx_BUFFER_DATA_READY |
++                S5L8900_UTRSTAT_RX_IRQ;
++        }
+         exynos4210_uart_update_irq(s);
+     }
+ }
+@@ -611,6 +803,11 @@ static void exynos4210_uart_reset(DeviceState *dev)
+     fifo_reset(&s->rx);
+     fifo_reset(&s->tx);
+ 
++    if (s->s5l8900_legacy) {
++        qemu_irq_lower(s->irq);
++        timer_del(s->fifo_timeout_timer);
++    }
++
+     trace_exynos_uart_rxsize(s->channel, s->rx.size);
+ }
+ 
+@@ -676,6 +873,18 @@ DeviceState *exynos4210_uart_create(hwaddr addr,
+     return dev;
+ }
+ 
++static void exynos4210_uart_cts(void *opaque, int line, int level)
++{
++    Exynos4210UartState *s = opaque;
++    if (s->s5l8900_legacy && s->cts_input != (level != 0)) {
++        s->reg[I_(UTRSTAT)] |= S5L8900_UTRSTAT_MODEM_IRQ;
++        s->cts_input = level != 0;
++        exynos4210_uart_update_irq(s);
++        return;
++    }
++    s->cts_input = level != 0;
++}
++
+ static void exynos4210_uart_init(Object *obj)
+ {
+     SysBusDevice *dev = SYS_BUS_DEVICE(obj);
+@@ -690,6 +899,7 @@ static void exynos4210_uart_init(Object *obj)
+ 
+     sysbus_init_irq(dev, &s->irq);
+     sysbus_init_irq(dev, &s->dmairq);
++    qdev_init_gpio_in_named(DEVICE(obj), exynos4210_uart_cts, "cts", 1);
+ }
+ 
+ static void exynos4210_uart_realize(DeviceState *dev, Error **errp)
+@@ -709,6 +919,8 @@ static Property exynos4210_uart_properties[] = {
+     DEFINE_PROP_UINT32("channel", Exynos4210UartState, channel, 0),
+     DEFINE_PROP_UINT32("rx-size", Exynos4210UartState, rx.size, 16),
+     DEFINE_PROP_UINT32("tx-size", Exynos4210UartState, tx.size, 16),
++    DEFINE_PROP_BOOL("s5l8900-legacy", Exynos4210UartState, s5l8900_legacy,
++                     false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/dma/pl080.c b/hw/dma/pl080.c
+index 167b031a584630944cde4eace15a4d9889197508..819a46e74591df4cd2c5b1d2d640b70614683437 100644
+--- a/hw/dma/pl080.c
++++ b/hw/dma/pl080.c
+@@ -90,6 +90,14 @@ static void pl080_update(PL080State *s)
+     qemu_set_irq(s->irq, errlevel || tclevel);
+ }
+ 
++static hwaddr pl080_bus_address(PL080State *s, uint32_t address)
++{
++    /* M68 iBoot passes its uncached 0x80000000 alias to the DMA engine.
++     * Preserve guest register values while resolving the bus transaction.
++     */
++    return s->s5l8900_uncached_alias ? address & 0x7fffffffU : address;
++}
++
+ static void pl080_run(PL080State *s)
+ {
+     int c;
+@@ -168,7 +176,7 @@ again:
+             swidth = 1 << ((ch->ctrl >> 18) & 7);
+             dwidth = 1 << ((ch->ctrl >> 21) & 7);
+             for (n = 0; n < dwidth; n+= swidth) {
+-                address_space_read(&s->downstream_as, ch->src,
++                address_space_read(&s->downstream_as, pl080_bus_address(s, ch->src),
+                                    MEMTXATTRS_UNSPECIFIED, buff + n, swidth);
+                 if (ch->ctrl & PL080_CCTRL_SI)
+                     ch->src += swidth;
+@@ -176,7 +184,7 @@ again:
+             xsize = (dwidth < swidth) ? swidth : dwidth;
+             /* ??? This may pad the value incorrectly for dwidth < 32.  */
+             for (n = 0; n < xsize; n += dwidth) {
+-                address_space_write(&s->downstream_as, ch->dest + n,
++                address_space_write(&s->downstream_as, pl080_bus_address(s, ch->dest + n),
+                                     MEMTXATTRS_UNSPECIFIED, buff + n, dwidth);
+                 if (ch->ctrl & PL080_CCTRL_DI)
+                     ch->dest += swidth;
+@@ -189,19 +197,19 @@ again:
+                 /* Transfer complete.  */
+                 if (ch->lli) {
+                     ch->src = address_space_ldl_le(&s->downstream_as,
+-                                                   ch->lli,
++                                                   pl080_bus_address(s, ch->lli),
+                                                    MEMTXATTRS_UNSPECIFIED,
+                                                    NULL);
+                     ch->dest = address_space_ldl_le(&s->downstream_as,
+-                                                    ch->lli + 4,
++                                                    pl080_bus_address(s, ch->lli + 4),
+                                                     MEMTXATTRS_UNSPECIFIED,
+                                                     NULL);
+                     ch->ctrl = address_space_ldl_le(&s->downstream_as,
+-                                                    ch->lli + 12,
++                                                    pl080_bus_address(s, ch->lli + 12),
+                                                     MEMTXATTRS_UNSPECIFIED,
+                                                     NULL);
+                     ch->lli = address_space_ldl_le(&s->downstream_as,
+-                                                   ch->lli + 8,
++                                                   pl080_bus_address(s, ch->lli + 8),
+                                                    MEMTXATTRS_UNSPECIFIED,
+                                                    NULL);
+                 } else {
+@@ -421,6 +429,7 @@ static void pl081_init(Object *obj)
+ }
+ 
+ static Property pl080_properties[] = {
++    DEFINE_PROP_BOOL("s5l8900-uncached-alias", PL080State, s5l8900_uncached_alias, false),
+     DEFINE_PROP_LINK("downstream", PL080State, downstream,
+                      TYPE_MEMORY_REGION, MemoryRegion *),
+     DEFINE_PROP_END_OF_LIST(),
+diff --git a/include/hw/arm/ipod_touch.h b/include/hw/arm/ipod_touch.h
+index 21e0969c40762c5b918e7bfbe4afb2696fc69037..0883abda3f56650a36d175c8b5bd63e5fb49f265 100644
+--- a/include/hw/arm/ipod_touch.h
++++ b/include/hw/arm/ipod_touch.h
+@@ -170,6 +170,8 @@ typedef struct {
+ 	char bootrom_path[1024];
+ 	char iboot_path[1024];
+ 	char nand_path[1024];
++	char nand_overlay_path[1024];
++	bool iphone_2g;
+ } IPodTouchMachineState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_8900_engine.h b/include/hw/arm/ipod_touch_8900_engine.h
+index a43089f1ce5219b65b3ef1f83868d27da7684f92..c60487a8ff6ccc442706b79b190594c2ad4c6a26 100644
+--- a/include/hw/arm/ipod_touch_8900_engine.h
++++ b/include/hw/arm/ipod_touch_8900_engine.h
+@@ -60,17 +60,31 @@ static void s5l8900_8900_engine_write(void *opaque, hwaddr offset, uint64_t valu
+     header8900 *header = malloc(sizeof(header8900));
+     address_space_rw(nsas, value, MEMTXATTRS_UNSPECIFIED, (uint8_t *)header, sizeof(header8900), 0);
+ 
+-	if( (header->magic[0] != 0x38) && // 8
+-	    (header->magic[1] != 0x39) && // 9
+-	    (header->magic[2] != 0x30) && // 0
++	if( (header->magic[0] != 0x38) || // 8
++	    (header->magic[1] != 0x39) || // 9
++	    (header->magic[2] != 0x30) || // 0
+ 	    (header->magic[3] != 0x30))  // 0
+ 	{
+ 		printf("Bad 8900 magic\n");
++		free(header);
+ 		return;
+ 	}
+ 
+-	if(header->encrypted == 0x03) { encrypted = 1; }
+-	else if( header->encrypted = 0x04 ) { encrypted = 0; }
++	/* The original 1A543a system kernel is a plaintext 8900 container.
++	 * Decrypting it corrupts the complzss stream. Flag 4 must be a no-op.
++	 */
++	if(header->encrypted == 0x04) {
++		printf("8900 plaintext image at 0x%08x; preserving payload\n", (unsigned)value);
++		free(header);
++		return;
++	}
++	if(header->encrypted != 0x03 || !header->sizeOfData ||
++	   header->sizeOfData > 32 * 1024 * 1024 ||
++	   header->sizeOfData % AES_BLOCK_SIZE) {
++		printf("Unsupported or invalid encrypted 8900 image\n");
++		free(header);
++		return;
++	}
+ 
+ 	data_begin = sizeof(header8900);
+ 	data_len = header->sizeOfData;
+diff --git a/include/hw/arm/ipod_touch_adm.h b/include/hw/arm/ipod_touch_adm.h
+index b9423bbdd94537e04927cf671ec75875b00e05ea..babdf33e8c875c0db835993a30ac7b3b35a4c8d4 100644
+--- a/include/hw/arm/ipod_touch_adm.h
++++ b/include/hw/arm/ipod_touch_adm.h
+@@ -28,6 +28,8 @@ typedef struct IPodTouchADMState {
+     uint32_t data1_sec_addr;
+     uint32_t data2_sec_addr;
+     uint32_t data3_sec_addr;
++    bool m68_layout;
++    uint16_t completion[4];
+ 
+     MemoryRegion *downstream;
+     AddressSpace downstream_as;
+@@ -35,4 +37,4 @@ typedef struct IPodTouchADMState {
+     ITNandState *nand_state;
+ } IPodTouchADMState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_gpio.h b/include/hw/arm/ipod_touch_gpio.h
+index 1707e39a76e8291a29bab075340bfb997c03574a..0ab1cc059c57dfe501bbc8c4391f79d95554856b 100644
+--- a/include/hw/arm/ipod_touch_gpio.h
++++ b/include/hw/arm/ipod_touch_gpio.h
+@@ -23,6 +23,10 @@ typedef struct IPodTouchGPIOState
+     SysBusDevice parent_obj;
+     MemoryRegion iomem;
+     uint32_t gpio_state;
++    uint32_t function_select;
++    uint32_t port_data[32];
++    bool iphone_2g;
++    qemu_irq multitouch_cs;
+ } IPodTouchGPIOState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_lcd.h b/include/hw/arm/ipod_touch_lcd.h
+index cc3490bf6b2c1b51079ec88b4345d6648a7d11b3..4338841081d65a5ba3fe0a20f14fd5dbb33c1950 100644
+--- a/include/hw/arm/ipod_touch_lcd.h
++++ b/include/hw/arm/ipod_touch_lcd.h
+@@ -51,7 +51,19 @@ typedef struct IPodTouchLCDState
+     uint32_t w2_display_depth_info;
+     uint32_t w2_qlen;
+ 
++    uint32_t w3_hspan;
++    uint32_t w3_framebuffer_base;
++    uint32_t w3_display_resolution_info;
++    uint32_t w3_display_depth_info;
++    uint32_t w3_qlen;
++
++    uint32_t w4_hspan;
++    uint32_t w4_framebuffer_base;
++    uint32_t w4_display_resolution_info;
++    uint32_t w4_display_depth_info;
++    uint32_t w4_qlen;
++
+     QEMUTimer *refresh_timer;
+ } IPodTouchLCDState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_multitouch.h b/include/hw/arm/ipod_touch_multitouch.h
+index d3d85f3ec83f6407c436d9ff4b03a1f91e4f0aa1..a1a0cf5276168038873bb11a264e2a85563ef658 100644
+--- a/include/hw/arm/ipod_touch_multitouch.h
++++ b/include/hw/arm/ipod_touch_multitouch.h
+@@ -54,6 +54,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
+ #define MT_CMD_SHORT_CONTROL_READ    0xE6
+ #define MT_CMD_FRAME_READ            0xEA
+ 
++/* Zephyr 1, used by the original iPhone OS 1.0 driver. */
++#define MT_Z1_PACKET_SIZE       0x400
++#define MT_Z1_FIRMWARE_RAM_SIZE 0x10000
++
+ // frame types
+ #define MT_FRAME_TYPE_PATH 0x44
+ 
+@@ -153,9 +157,27 @@ typedef struct IPodTouchMultitouchState {
+     float prev_touch_x;
+     float prev_touch_y;
+     uint64_t last_frame_timestamp;
++    unsigned gpio_attention;
++    unsigned gpio_home_pin;
++    unsigned gpio_home_irq;
++    bool zephyr1;
++    bool z1_running;
++    bool z1_upload_valid;
++    bool z1_main_upload;
++    uint8_t z1_command;
++    uint32_t z1_index;
++    uint32_t z1_length;
++    uint16_t z1_upload_checksum;
++    uint8_t z1_in[MT_Z1_PACKET_SIZE];
++    uint8_t z1_out[MT_Z1_PACKET_SIZE];
++    uint8_t z1_firmware[MT_Z1_FIRMWARE_RAM_SIZE];
++    uint8_t z1_main_firmware[MT_Z1_FIRMWARE_RAM_SIZE];
++    uint32_t z1_main_length;
++    uint8_t z1_report70;
+ } IPodTouchMultitouchState;
+ 
+ void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
+ void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s);
++void ipod_touch_multitouch_end_transfer(IPodTouchMultitouchState *s);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_nand.h b/include/hw/arm/ipod_touch_nand.h
+index e5a07e63cee18e15d00b8588eddefe3bef57a2e8..b40b644ec400f0853b243632472502211f034e87 100644
+--- a/include/hw/arm/ipod_touch_nand.h
++++ b/include/hw/arm/ipod_touch_nand.h
+@@ -11,6 +11,7 @@
+ #define NAND_NUM_BANKS 8
+ #define NAND_BYTES_PER_PAGE 2048
+ #define NAND_BYTES_PER_SPARE 64
++#define NAND_PAGES_PER_BANK 524288
+ 
+ #define NAND_CHIP_ID 0xA514D3AD
+ 
+@@ -60,8 +61,14 @@ typedef struct ITNandState {
+     bool is_writing;
+     QemuMutex lock;
+     char *nand_path;
++    char *nand_overlay;
++    uint8_t erased_page_fill;
++    uint8_t bank_mask;
+ } ITNandState;
+ 
++/* Either output may be NULL; this does not change the FIFO page cache. */
++void nand_read_page(ITNandState *s, uint32_t bank, uint32_t page,
++                    uint8_t *data, uint8_t *spare);
+ void nand_set_buffered_page(ITNandState *s, uint32_t page);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_pcf50633_pmu.h b/include/hw/arm/ipod_touch_pcf50633_pmu.h
+index af090c5698a7367579d8149cd70189bad6b560bb..15c6ef66eec4807264535cb5cdba10a9ebd76b25 100644
+--- a/include/hw/arm/ipod_touch_pcf50633_pmu.h
++++ b/include/hw/arm/ipod_touch_pcf50633_pmu.h
+@@ -27,6 +27,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Pcf50633State, PCF50633)
+ typedef struct Pcf50633State {
+ 	I2CSlave i2c;
+ 	uint32_t cmd;
++    bool battery_adc_ready;
+ } Pcf50633State;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_sysic.h b/include/hw/arm/ipod_touch_sysic.h
+index 8e6ae77cfb44840ef23e476caf1dd69e8ac33594..9e521b34ecdc4e011a27c503663e24c4146d2220 100644
+--- a/include/hw/arm/ipod_touch_sysic.h
++++ b/include/hw/arm/ipod_touch_sysic.h
+@@ -37,6 +37,13 @@ typedef struct IPodTouchSYSICState {
+     uint32_t gpio_int_status[GPIO_NUMINTGROUPS];
+     uint32_t gpio_int_enabled[GPIO_NUMINTGROUPS];
+     uint32_t gpio_int_type[GPIO_NUMINTGROUPS];
++    bool iphone_2g;
++    uint32_t gpio_input_level[GPIO_NUMINTGROUPS];
++    uint32_t gpio_input_known[GPIO_NUMINTGROUPS];
+ } IPodTouchSYSICState;
+ 
+-#endif
+\ No newline at end of file
++void ipod_touch_sysic_gpio_input(IPodTouchSYSICState *s, unsigned interrupt,
++                                bool high);
++void ipod_touch_sysic_gpio_event(IPodTouchSYSICState *s, unsigned interrupt);
++
++#endif
+diff --git a/include/hw/arm/ipod_touch_timer.h b/include/hw/arm/ipod_touch_timer.h
+index 3a3af5033fbcfc37bf8b768d8851df36a97f6299..d0703ae13fe39e9ffa7daff9470c7e94580083a8 100644
+--- a/include/hw/arm/ipod_touch_timer.h
++++ b/include/hw/arm/ipod_touch_timer.h
+@@ -24,6 +24,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchTimerState, IPOD_TOUCH_TIMER)
+ #define TIMER_STATE 0x4
+ #define TIMER_COUNT_BUFFER 0x8
+ #define TIMER_COUNT_BUFFER2 0xC
++#define TIMER_PRESCALER 0x10
++#define TIMER_CURRENT_COUNT 0x14
+ 
+ typedef struct IPodTouchTimerState
+ {
+@@ -47,6 +49,14 @@ typedef struct IPodTouchTimerState
+     uint64_t base_time;
+     qemu_irq    irq;
+ 
++    /* Opt-in iPhone1,1 timer4 path; the N45 implementation stays unchanged. */
++    bool s5l8900_legacy;
++    bool legacy_running;
++    bool legacy_loaded;
++    uint32_t legacy_count;
++    uint32_t legacy_freq_hz;
++    uint64_t legacy_epoch_ns;
++
+ } IPodTouchTimerState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/dma/pl080.h b/include/hw/dma/pl080.h
+index 3c9659e4381f9218501c35cd191b1a08ebcf4ca0..92ab3e12241d4b8775b98bc41fee43aed6c880fb 100644
+--- a/include/hw/dma/pl080.h
++++ b/include/hw/dma/pl080.h
+@@ -68,6 +68,7 @@ struct PL080State {
+ 
+     MemoryRegion *downstream;
+     AddressSpace downstream_as;
++    bool s5l8900_uncached_alias;
+ };
+ 
+ #endif

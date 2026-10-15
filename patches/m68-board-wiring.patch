@@ -1,0 +1,417 @@
+diff --git a/hw/arm/ipod_touch.c b/hw/arm/ipod_touch.c
+index cbfe127..67f6b1a 100644
+--- a/hw/arm/ipod_touch.c
++++ b/hw/arm/ipod_touch.c
+@@ -275,8 +275,20 @@ static void ipod_touch_set_nand_path(Object *obj, const char *value, Error **err
+     g_strlcpy(nms->nand_path, value, sizeof(nms->nand_path));
+ }
+ 
++static bool ipod_touch_get_iphone_2g(Object *obj, Error **errp)
++{
++    return IPOD_TOUCH_MACHINE(obj)->iphone_2g;
++}
++
++static void ipod_touch_set_iphone_2g(Object *obj, bool value, Error **errp)
++{
++    IPOD_TOUCH_MACHINE(obj)->iphone_2g = value;
++}
++
+ static void ipod_touch_instance_init(Object *obj)
+ {
++	object_property_add_bool(obj, "iphone-2g", ipod_touch_get_iphone_2g, ipod_touch_set_iphone_2g);
++	object_property_set_description(obj, "iphone-2g", "Experimental M68 board wiring; full iPhone OS boot is not yet verified");
+ 	object_property_add_str(obj, "bootrom", ipod_touch_get_bootrom_path, ipod_touch_set_bootrom_path);
+     object_property_set_description(obj, "bootrom", "Path to the S5L8900 bootrom binary");
+ 
+@@ -321,15 +333,15 @@ static void ipod_touch_key_event(void *opaque, int keycode)
+     }
+     else if(keycode == 35 || keycode == 163) {
+         // home button
+-        gpio_group = GPIO_BUTTON_HOME_IRQ / NUM_GPIO_PINS;
+-        gpio_selector = GPIO_BUTTON_HOME_IRQ % NUM_GPIO_PINS;
++        gpio_group = s->gpio_home_irq / NUM_GPIO_PINS;
++        gpio_selector = s->gpio_home_irq % NUM_GPIO_PINS;
+ 
+-        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (GPIO_BUTTON_HOME & 0xf))) == 0) {
+-            s->gpio_state->gpio_state |= (1 << (GPIO_BUTTON_HOME & 0xf));
++        if(keycode == 35 && (s->gpio_state->gpio_state & (1 << (s->gpio_home_pin & 0xf))) == 0) {
++            s->gpio_state->gpio_state |= (1 << (s->gpio_home_pin & 0xf));
+             do_irq = true;
+         }
+         else if(keycode == 163) {
+-            s->gpio_state->gpio_state &= ~(1 << (GPIO_BUTTON_HOME & 0xf));
++            s->gpio_state->gpio_state &= ~(1 << (s->gpio_home_pin & 0xf));
+             do_irq = true;
+         }
+     }
+@@ -468,6 +480,10 @@ static void ipod_touch_machine_init(MachineState *machine)
+     spi2_state->mt->sysic = sysic_state;
+     spi2_state->mt->gpio_state = gpio_state;
+     nms->spi2_state = spi2_state;
++    spi2_state->mt->zephyr1 = nms->iphone_2g;
++    spi2_state->mt->gpio_attention = nms->iphone_2g ? 0xa3 : 0x9b;
++    spi2_state->mt->gpio_home_pin = nms->iphone_2g ? 0x1600 : GPIO_BUTTON_HOME;
++    spi2_state->mt->gpio_home_irq = nms->iphone_2g ? 0x28 : GPIO_BUTTON_HOME_IRQ;
+ 
+     ipod_touch_memory_setup(machine, sysmem, nsas);
+ 
+@@ -564,6 +580,7 @@ static void ipod_touch_machine_init(MachineState *machine)
+     // init two pl080 DMAC0 devices
+     dev = qdev_new("pl080");
+     PL080State *pl080_1 = PL080(dev);
++    object_property_set_bool(OBJECT(dev), "s5l8900-uncached-alias", nms->iphone_2g, &error_fatal);
+     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+     memory_region_add_subregion(sysmem, DMAC0_MEM_BASE, &pl080_1->iomem);
+     busdev = SYS_BUS_DEVICE(dev);
+@@ -572,6 +589,7 @@ static void ipod_touch_machine_init(MachineState *machine)
+ 
+     dev = qdev_new("pl080");
+     PL080State *pl080_2 = PL080(dev);
++    object_property_set_bool(OBJECT(dev), "s5l8900-uncached-alias", nms->iphone_2g, &error_fatal);
+     object_property_set_link(OBJECT(dev), "downstream", OBJECT(sysmem), &error_fatal);
+     memory_region_add_subregion(sysmem, DMAC1_MEM_BASE, &pl080_2->iomem);
+     busdev = SYS_BUS_DEVICE(dev);
+@@ -597,7 +615,9 @@ static void ipod_touch_machine_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, I2C1_MEM_BASE, &i2c_state->iomem);
+ 
+     // init the PMU
+-    I2CSlave *pmu = i2c_slave_create_simple(i2c_state->bus, "pcf50633", 0x73);
++    I2CBus *pmu_bus = nms->iphone_2g ? nms->i2c0_state->bus : nms->i2c1_state->bus;
++    I2CSlave *pmu = i2c_slave_create_simple(pmu_bus, "pcf50633", 0x73);
++    PCF50633(pmu)->battery_adc_ready = nms->iphone_2g;
+ 
+     // init the ADM
+     dev = qdev_new("ipodtouch.adm");
+diff --git a/hw/arm/ipod_touch_multitouch.c b/hw/arm/ipod_touch_multitouch.c
+index 8a1c94d..f565c23 100644
+--- a/hw/arm/ipod_touch_multitouch.c
++++ b/hw/arm/ipod_touch_multitouch.c
+@@ -1,4 +1,238 @@
+ #include "hw/arm/ipod_touch_multitouch.h"
++#include "qemu/bswap.h"
++
++/*
++ * Zephyr 1 packet formats are verified against the original 1A543a kernel's
++ * AppleMultitouchSPI driver and openiBoot's multitouch-z1.c. This models the
++ * controller protocol and downloaded RAM; it does not execute ASIC firmware.
++ * Zephyr 2 continues through the original transfer handler below.
++ */
++static unsigned z1_report_size(uint8_t report)
++{
++    switch (report) {
++    case MT_REPORT_UNKNOWN1:
++    case MT_REPORT_FAMILY_ID:
++    case MT_REPORT_SENSOR_REGION_DESC:
++    case MT_REPORT_SENSOR_REGION_PARAM:
++        return 1;
++    case MT_REPORT_SENSOR_INFO:
++        return 5;
++    case MT_REPORT_SENSOR_DIMENSIONS:
++        return 8;
++    default:
++        return 0;
++    }
++}
++
++static void z1_prepare_report(IPodTouchMultitouchState *s, uint8_t report)
++{
++    uint8_t *data = s->z1_out + 4;
++    unsigned length = z1_report_size(report);
++    uint16_t checksum = report;
++    unsigned i;
++
++    s->z1_out[1] = report;
++    switch (report) {
++    case MT_REPORT_UNKNOWN1:
++        data[0] = s->z1_report70;
++        break;
++    case MT_REPORT_FAMILY_ID:
++        data[0] = MT_FAMILY_ID;
++        break;
++    case MT_REPORT_SENSOR_INFO:
++        data[0] = MT_ENDIANNESS;
++        data[1] = MT_SENSOR_ROWS;
++        data[2] = MT_SENSOR_COLUMNS;
++        stw_be_p(data + 3, MT_BCD_VERSION);
++        break;
++    case MT_REPORT_SENSOR_REGION_DESC:
++        data[0] = MT_SENSOR_REGION_DESC;
++        break;
++    case MT_REPORT_SENSOR_REGION_PARAM:
++        data[0] = MT_SENSOR_REGION_PARAM;
++        break;
++    case MT_REPORT_SENSOR_DIMENSIONS:
++        stl_le_p(data, MT_SENSOR_SURFACE_WIDTH);
++        stl_le_p(data + 4, MT_SENSOR_SURFACE_HEIGHT);
++        break;
++    default:
++        hw_error("Zephyr 1: unsupported report read 0x%02x", report);
++    }
++    for (i = 0; i < length; i++) {
++        checksum += data[i];
++    }
++    stw_be_p(data + length, checksum);
++}
++
++static unsigned z1_frame_length(IPodTouchMultitouchState *s)
++{
++    return s->next_frame ? sizeof(MTFrameHeader) + sizeof(FingerData) + 2 : 0;
++}
++
++static void z1_prepare_frame(IPodTouchMultitouchState *s)
++{
++    unsigned length = z1_frame_length(s);
++    uint16_t checksum = 0;
++    unsigned i;
++
++    if (!length) {
++        /* Empty result: marker and a checksum over an empty payload. */
++        s->z1_length = 3;
++        return;
++    }
++    memcpy(s->z1_out + 1, &s->next_frame->frame_packet.header,
++           sizeof(MTFrameHeader));
++    memcpy(s->z1_out + 1 + sizeof(MTFrameHeader),
++           &s->next_frame->finger_data, sizeof(FingerData));
++    for (i = 1; i < length - 1; i++) {
++        checksum += s->z1_out[i];
++    }
++    stw_be_p(s->z1_out + length - 1, checksum);
++    s->z1_length = length + 1;
++}
++
++static uint32_t zephyr1_transfer(IPodTouchMultitouchState *s, uint8_t value)
++{
++    uint8_t result;
++    unsigned i;
++
++    if (!s->z1_index) {
++        unsigned length = z1_frame_length(s);
++        s->z1_command = value;
++        memset(s->z1_in, 0, sizeof(s->z1_in));
++        memset(s->z1_out, 0, sizeof(s->z1_out));
++        s->z1_out[0] = s->z1_running ? 0xaa : 0xd0;
++
++        switch (value) {
++        case 0xc2: /* Download: C2, addressBE, reserved, data, checksumBE. */
++            s->z1_length = MT_Z1_PACKET_SIZE;
++            s->z1_running = false;
++            s->z1_out[0] = 0;
++            break;
++        case 0xc4: /* Execute: C4 00 00 C4. */
++            s->z1_length = 4;
++            s->z1_out[0] = 0;
++            break;
++        case 0x05: /* Checksum query: 05 00 00 06. */
++            s->z1_length = 4;
++            s->z1_out[1] = s->z1_upload_valid ? 0 : 1;
++            stw_be_p(s->z1_out + 2, s->z1_upload_checksum);
++            break;
++        case 0xd0: /* Interface query, four bytes, big-endian packet size. */
++            s->z1_length = 4;
++            s->z1_out[1] = MT_INTERFACE_VERSION;
++            stw_be_p(s->z1_out + 2, MT_MAX_PACKET_SIZE);
++            break;
++        case 0x8f: /* Report metadata; report ID arrives in byte 1. */
++            s->z1_length = 8;
++            break;
++        case 0x82: /* Report read, report ID arrives in byte 1. */
++        case 0x92: /* Report write, report ID arrives in byte 1. */
++            s->z1_length = 6;
++            break;
++        case 0x46: /* Interface <= 0x10: compact frame-length response. */
++            s->z1_length = 8;
++            stw_be_p(s->z1_out + 1, length);
++            stw_be_p(s->z1_out + 3,
++                     s->z1_out[1] + s->z1_out[2]);
++            break;
++        case 0x64: /* Interface > 0x10: extended frame-length response. */
++        case 0x65:
++            s->z1_length = 8;
++            stw_be_p(s->z1_out + 4, length);
++            stw_be_p(s->z1_out + 6,
++                     s->z1_out[4] + s->z1_out[5]);
++            break;
++        case 0x47:
++        case 0x68:
++            z1_prepare_frame(s);
++            break;
++        default:
++            hw_error("Zephyr 1: unsupported command 0x%02x", value);
++        }
++    }
++
++    if (s->z1_index >= MT_Z1_PACKET_SIZE) {
++        hw_error("Zephyr 1: packet exceeds modeled transfer buffer");
++    }
++    s->z1_in[s->z1_index] = value;
++    if (s->z1_index == 1) {
++        uint8_t report = value;
++        unsigned length = z1_report_size(report);
++
++        switch (s->z1_command) {
++        case 0x8f:
++            s->z1_out[1] = report;
++            /* The upper nibble is a report error, not a length bit. */
++            s->z1_out[4] = length ? length >> 8 : 0x10;
++            s->z1_out[5] = length;
++            stw_be_p(s->z1_out + 6,
++                     report + s->z1_out[4] + s->z1_out[5]);
++            break;
++        case 0x82:
++            z1_prepare_report(s, report);
++            s->z1_length = length + 6;
++            break;
++        case 0x92:
++            if (!length) {
++                hw_error("Zephyr 1: unsupported report write 0x%02x", report);
++            }
++            s->z1_out[1] = report;
++            s->z1_length = length + 6;
++            break;
++        }
++    }
++    if (s->z1_command == 0x92 && s->z1_index == s->z1_length - 3) {
++        uint16_t checksum = s->z1_in[1];
++        for (i = 4; i < s->z1_length - 2; i++) {
++            checksum += s->z1_in[i];
++        }
++        stw_be_p(s->z1_out + s->z1_length - 2, checksum);
++    }
++
++    result = s->z1_out[s->z1_index++];
++    if (s->z1_index == s->z1_length) {
++        switch (s->z1_command) {
++        case 0xc2: {
++            uint32_t address = ldl_be_p(s->z1_in + 1);
++            uint16_t checksum = 0;
++            for (i = 0; i < MT_Z1_PACKET_SIZE - 2; i++) {
++                checksum += s->z1_in[i];
++            }
++            s->z1_upload_checksum = checksum;
++            s->z1_upload_valid =
++                checksum == lduw_be_p(s->z1_in + MT_Z1_PACKET_SIZE - 2) &&
++                address >= 0x40000000 &&
++                address - 0x40000000 <= MT_Z1_FIRMWARE_RAM_SIZE - 0x3f8;
++            if (s->z1_upload_valid) {
++                memcpy(s->z1_firmware + address - 0x40000000,
++                       s->z1_in + 6, 0x3f8);
++            }
++            break;
++        }
++        case 0xc4:
++            s->z1_running = s->z1_upload_valid &&
++                s->z1_in[1] == 0 && s->z1_in[2] == 0 &&
++                s->z1_in[3] == 0xc4;
++            break;
++        case 0x92:
++            if (s->z1_in[1] == MT_REPORT_UNKNOWN1 &&
++                lduw_be_p(s->z1_in + s->z1_length - 2) ==
++                lduw_be_p(s->z1_out + s->z1_length - 2)) {
++                s->z1_report70 = s->z1_in[4];
++            }
++            break;
++        case 0x47:
++        case 0x68:
++            free(s->next_frame);
++            s->next_frame = NULL;
++            break;
++        }
++        s->z1_index = 0;
++        s->z1_command = 0;
++    }
++    return result;
++}
+ 
+ static void prepare_interface_version_response(IPodTouchMultitouchState *s) {
+     memset(s->out_buffer + 1, 0, 15);
+@@ -120,6 +354,11 @@ static uint32_t ipod_touch_multitouch_transfer(SSIPeripheral *dev, uint32_t valu
+ {
+     IPodTouchMultitouchState *s = IPOD_TOUCH_MULTITOUCH(dev);
+ 
++    if (s->zephyr1 || value == 0xc2 || value == 0xc4 || value == 0x05) {
++        s->zephyr1 = true;
++        return zephyr1_transfer(s, value);
++    }
++
+     //printf("<MULTITOUCH> Got value: 0x%02x\n", value);
+ 
+     if(s->cur_cmd == 0) {
+@@ -341,8 +580,10 @@ static MTFrame *get_frame(IPodTouchMultitouchState *s, uint8_t event, float x, f
+ }
+ 
+ static void ipod_touch_multitouch_inform_frame_ready(IPodTouchMultitouchState *s) {
+-    s->sysic->gpio_int_status[4] |= (1 << 27); // the multitouch interrupt bit is in group 4 (32 interrupts per group), and the 27th of the 4th group
+-    qemu_irq_raise(s->sysic->gpio_irqs[4]);
++    unsigned group = s->gpio_attention / NUM_GPIO_PINS;
++    unsigned pin = s->gpio_attention % NUM_GPIO_PINS;
++    s->sysic->gpio_int_status[group] |= (1U << pin);
++    qemu_irq_raise(s->sysic->gpio_irqs[group]);
+ }
+ 
+ void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s) {
+@@ -394,6 +635,9 @@ static void ipod_touch_multitouch_realize(SSIPeripheral *d, Error **errp)
+     s->prev_touch_x = 0;
+     s->prev_touch_y = 0;
+     s->last_frame_timestamp = 0;
++    s->gpio_attention = 0x9b;
++    s->gpio_home_pin = GPIO_BUTTON_HOME;
++    s->gpio_home_irq = GPIO_BUTTON_HOME_IRQ;
+ }
+ 
+ static void ipod_touch_multitouch_class_init(ObjectClass *klass, void *data)
+diff --git a/include/hw/arm/ipod_touch.h b/include/hw/arm/ipod_touch.h
+index 21e0969..7350bf8 100644
+--- a/include/hw/arm/ipod_touch.h
++++ b/include/hw/arm/ipod_touch.h
+@@ -170,6 +170,7 @@ typedef struct {
+ 	char bootrom_path[1024];
+ 	char iboot_path[1024];
+ 	char nand_path[1024];
++	bool iphone_2g;
+ } IPodTouchMachineState;
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/include/hw/arm/ipod_touch_multitouch.h b/include/hw/arm/ipod_touch_multitouch.h
+index d3d85f3..9aaf0da 100644
+--- a/include/hw/arm/ipod_touch_multitouch.h
++++ b/include/hw/arm/ipod_touch_multitouch.h
+@@ -54,6 +54,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchMultitouchState, IPOD_TOUCH_MULTITOUCH)
+ #define MT_CMD_SHORT_CONTROL_READ    0xE6
+ #define MT_CMD_FRAME_READ            0xEA
+ 
++/* Zephyr 1, used by the original iPhone OS 1.0 driver. */
++#define MT_Z1_PACKET_SIZE       0x400
++#define MT_Z1_FIRMWARE_RAM_SIZE 0x10000
++
+ // frame types
+ #define MT_FRAME_TYPE_PATH 0x44
+ 
+@@ -153,9 +157,23 @@ typedef struct IPodTouchMultitouchState {
+     float prev_touch_x;
+     float prev_touch_y;
+     uint64_t last_frame_timestamp;
++    unsigned gpio_attention;
++    unsigned gpio_home_pin;
++    unsigned gpio_home_irq;
++    bool zephyr1;
++    bool z1_running;
++    bool z1_upload_valid;
++    uint8_t z1_command;
++    uint32_t z1_index;
++    uint32_t z1_length;
++    uint16_t z1_upload_checksum;
++    uint8_t z1_in[MT_Z1_PACKET_SIZE];
++    uint8_t z1_out[MT_Z1_PACKET_SIZE];
++    uint8_t z1_firmware[MT_Z1_FIRMWARE_RAM_SIZE];
++    uint8_t z1_report70;
+ } IPodTouchMultitouchState;
+ 
+ void ipod_touch_multitouch_on_touch(IPodTouchMultitouchState *s);
+ void ipod_touch_multitouch_on_release(IPodTouchMultitouchState *s);
+ 
+-#endif
+\ No newline at end of file
++#endif
